@@ -68,6 +68,7 @@
           <option value="start"{% if start_mode() %} selected{% endif %}>Start date (due date if no start)</option>
         </select>
       </label>
+      <p class="hint">ClickUp cannot filter by start date, so start date mode reads every open task in the list. On a big list, use a tag filter.</p>
       <label>
         <span>Time zone for digest schedules</span>
         <input type="text" name="timezone" value="{{ cfg.timezone }}" list="time-zones" required autocomplete="off">

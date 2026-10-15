@@ -19,8 +19,6 @@ pub const MAX_AGE: Duration = Duration::from_secs(5 * 60);
 pub const FRESH: Duration = Duration::from_secs(55);
 /// Events that started this long ago are still read, so the dashboard can show them.
 pub const LOOKBACK_SECS: i64 = 12 * 3600;
-/// In start date mode a task may start in the window but be due later.
-const START_MODE_SPAN_SECS: i64 = 31 * 86400;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
@@ -154,14 +152,12 @@ pub async fn fetch(
         Err(p) => return Ok(Err(FetchError::Token(p))),
     };
     let start_mode = cfg.start_mode();
-    let upper = if start_mode {
-        to + START_MODE_SPAN_SECS
-    } else {
-        to
-    };
+    // ClickUp cannot filter by start date and drops tasks without a due date under a due
+    // date filter, so start mode reads the open tasks of the list and filters below.
+    let due_filter = !start_mode;
     let query = TaskQuery {
-        due_after_ms: Some(from * 1000 - 1),
-        due_before_ms: Some(upper * 1000 + 1),
+        due_after_ms: due_filter.then(|| from * 1000 - 1),
+        due_before_ms: due_filter.then(|| to * 1000 + 1),
         include_closed: cfg.include_closed,
         subtasks: cfg.include_subtasks,
         tags: cfg.tags(),
@@ -317,6 +313,8 @@ mod tests {
         let (state, mock, mut cfg) = setup().await;
         let mut long = mock::task("long", "Conference", at(NOW + 20 * 86400));
         long["start_date"] = json!(((NOW + 3600) * 1000).to_string());
+        let mut start_only = mock::task("start_only", "Workshop", None);
+        start_only["start_date"] = json!(((NOW + 5400) * 1000).to_string());
         mock.set_tasks(
             mock::LIST_ID,
             vec![
@@ -326,6 +324,7 @@ mod tests {
                 mock::task("past", "Past", at(NOW - 60)),
                 mock::task("far", "Far", at(NOW + 30 * 86400)),
                 long,
+                start_only,
             ],
         );
 
@@ -336,8 +335,12 @@ mod tests {
         let ids: Vec<&str> = f.events.iter().map(|e| e.task_id.as_str()).collect();
         assert_eq!(ids, ["same", "soon", "later"]);
         assert!(!f.truncated);
+        let due_query = mock.requests().last().unwrap().query.clone();
+        assert!(due_query.contains("due_date_gt="), "{due_query}");
+        assert!(due_query.contains("due_date_lt="), "{due_query}");
 
-        // Start mode finds the conference that starts soon but is due in 20 days.
+        // Start mode finds the conference that starts soon but is due in 20 days, and the
+        // workshop without a due date, which a due date filter would hide.
         cfg.time_field = "start".into();
         let f = fetch(&state, 1, &cfg, NOW, NOW + 86400)
             .await
@@ -348,10 +351,17 @@ mod tests {
                 .iter()
                 .any(|e| e.task_id == "long" && e.at == NOW + 3600)
         );
+        assert!(
+            f.events
+                .iter()
+                .any(|e| e.task_id == "start_only" && e.at == NOW + 5400)
+        );
+        let start_query = mock.requests().last().unwrap().query.clone();
+        assert!(!start_query.contains("due_date_"), "{start_query}");
         assert_eq!(
             f.between(NOW + 3600, NOW + 86400).len(),
-            1,
-            "after `from` only"
+            2,
+            "after `from` only: the workshop and the later task"
         );
 
         assert!(mock.requests().iter().all(|r| r.method == "GET"));
