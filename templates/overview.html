@@ -15,6 +15,17 @@
 </div>
 {% endif %}
 
+{% if let Some(error) = bot.error %}
+<div class="callout callout-err">{{ error }}</div>
+{% endif %}
+
+{% if !bot.missing_intents.is_empty() %}
+<div class="callout callout-warn">
+  {{ bot.missing_intents.join(", ") }} disabled in the Discord developer portal, so the bot runs without it and
+  modules that depend on it do not work. Enable it on the <strong>Bot</strong> tab of your application and restart the bot.
+</div>
+{% endif %}
+
 <section class="card bot-card">
   {% if let Some(avatar) = bot.avatar %}
   <img class="avatar-lg" src="{{ avatar }}" alt="">

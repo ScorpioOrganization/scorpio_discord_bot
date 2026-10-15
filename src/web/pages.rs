@@ -14,6 +14,7 @@ use super::{MsgQuery, PageCtx, fmt_duration, fmt_ts, redirect_msg, require_guild
 use crate::auth::extract::{CurrentUser, RootUser, client_ip};
 use crate::auth::{self, SESSION_COOKIE, SESSION_TTL_SECS};
 use crate::bot::info::{self, BotStatus, GuildSummary};
+use crate::bot::privileged_names;
 use crate::db::now;
 use crate::error::{AppError, AppResult};
 use crate::modules::{self, StatItem};
@@ -134,7 +135,7 @@ pub async fn overview(
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
     let discord = state.discord();
-    let bot = info::status(discord).await;
+    let bot = info::status(&state).await;
     let guilds = discord.map(|d| info::guilds(&d.cache)).unwrap_or_default();
 
     let mut rows = Vec::with_capacity(guilds.len());
@@ -150,7 +151,7 @@ pub async fn overview(
     let page = OverviewPage {
         page: PageCtx::new(&user, "overview", &msg),
         bot,
-        token_configured: discord.is_some(),
+        token_configured: state.config.discord_token.is_some(),
         uptime: fmt_duration(stats.started_at.elapsed().as_secs()),
         guild_count: rows.len(),
         member_total: rows.iter().map(|r| r.guild.member_count).sum(),
@@ -171,6 +172,8 @@ struct ModuleCard {
     description: &'static str,
     enabled: bool,
     stats: Vec<StatItem>,
+    /// Developer portal names of privileged intents this module needs but the bot runs without.
+    missing_intents: Vec<&'static str>,
 }
 
 #[derive(Template)]
@@ -196,6 +199,7 @@ pub async fn guild_page(
             description: m.description(),
             enabled: modules::is_enabled(&state.db, gid, m.id()).await?,
             stats: m.summary(&state, gid).await?,
+            missing_intents: privileged_names(state.missing_intents(m.intents())),
         });
     }
     let page = GuildPage {

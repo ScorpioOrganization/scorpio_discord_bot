@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::Router;
-use serenity::all::{Context, Member};
+use serenity::all::{Context, GatewayIntents, Member};
 use sqlx::SqlitePool;
 
 use crate::db::sf;
@@ -27,6 +27,11 @@ pub trait Module: Send + Sync + 'static {
 
     /// Dashboard routes. Paths must start with `/guilds/{gid}/modules/<id>`.
     fn routes(&self) -> Router<AppState>;
+
+    /// Gateway intents the module's event hooks rely on, on top of `GUILDS`.
+    fn intents(&self) -> GatewayIntents {
+        GatewayIntents::empty()
+    }
 
     async fn on_member_join(
         &self,

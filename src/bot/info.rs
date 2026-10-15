@@ -2,7 +2,7 @@
 
 use serenity::all::{Cache, ChannelType, ConnectionStage, GuildId, Permissions};
 
-use crate::state::DiscordHandle;
+use crate::state::AppState;
 
 pub struct GuildSummary {
     pub id: u64,
@@ -38,6 +38,10 @@ pub struct BotStatus {
     pub latency_ms: Option<u128>,
     pub name: Option<String>,
     pub avatar: Option<String>,
+    /// Why the connection is down, when it stopped for good.
+    pub error: Option<String>,
+    /// Developer portal names of privileged intents modules need but the bot runs without.
+    pub missing_intents: Vec<&'static str>,
 }
 
 pub fn guilds(cache: &Cache) -> Vec<GuildSummary> {
@@ -97,14 +101,21 @@ pub fn text_channels(cache: &Cache, guild_id: u64) -> Vec<ChannelOption> {
     channels.into_iter().map(|(_, c)| c).collect()
 }
 
-pub async fn status(handle: Option<&DiscordHandle>) -> BotStatus {
-    let Some(handle) = handle else {
+pub async fn status(state: &AppState) -> BotStatus {
+    let error = state.bot_error();
+    let Some(handle) = state.discord() else {
         return BotStatus {
             online: false,
-            stage: "Not configured",
+            stage: if error.is_some() {
+                "Stopped"
+            } else {
+                "Not configured"
+            },
             latency_ms: None,
             name: None,
             avatar: None,
+            error,
+            missing_intents: Vec::new(),
         };
     };
 
@@ -127,6 +138,7 @@ pub async fn status(handle: Option<&DiscordHandle>) -> BotStatus {
     BotStatus {
         online: stage == ConnectionStage::Connected,
         stage: match stage {
+            _ if error.is_some() => "Stopped",
             ConnectionStage::Connected => "Online",
             ConnectionStage::Disconnected => "Offline",
             ConnectionStage::Resuming => "Resuming",
@@ -135,5 +147,9 @@ pub async fn status(handle: Option<&DiscordHandle>) -> BotStatus {
         latency_ms: latency.map(|d| d.as_millis()),
         name,
         avatar,
+        error,
+        missing_intents: super::privileged_names(
+            state.missing_intents(super::wanted_intents(&state.modules)),
+        ),
     }
 }

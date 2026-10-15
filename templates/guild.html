@@ -32,6 +32,9 @@
       <span class="badge badge-off">Disabled</span>
       {% endif %}
     </div>
+    {% if !m.missing_intents.is_empty() %}
+    <p class="callout callout-warn small">Needs {{ m.missing_intents.join(", ") }}, which is disabled in the Discord developer portal. This module does nothing until it is enabled.</p>
+    {% endif %}
     <dl class="kv">
       {% for s in m.stats %}
       <div><dt>{{ s.label }}</dt><dd>{{ s.value }}</dd></div>

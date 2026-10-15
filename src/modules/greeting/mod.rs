@@ -5,7 +5,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::Router;
 use serenity::all::{
-    ChannelId, Context, CreateAllowedMentions, CreateEmbed, CreateMessage, Http, Member, UserId,
+    ChannelId, Context, CreateAllowedMentions, CreateEmbed, CreateMessage, GatewayIntents, Http,
+    Member, UserId,
 };
 use sqlx::SqlitePool;
 
@@ -66,6 +67,11 @@ impl Module for GreetingModule {
 
     fn routes(&self) -> Router<AppState> {
         web::routes()
+    }
+
+    fn intents(&self) -> GatewayIntents {
+        // Member join events are only delivered with this privileged intent.
+        GatewayIntents::GUILD_MEMBERS
     }
 
     async fn on_member_join(&self, ctx: &Context, state: &AppState, member: &Member) -> Result<()> {

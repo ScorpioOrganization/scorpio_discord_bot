@@ -51,26 +51,43 @@ async fn main() -> Result<()> {
     let state = AppState::new(db, config.clone(), modules::registry());
     tokio::spawn(maintenance(state.clone()));
 
-    match config.discord_token.as_deref() {
-        Some(token) => {
-            let mut client = bot::build_client(token, state.clone()).await?;
-            let _ = state.discord.set(DiscordHandle {
-                http: client.http.clone(),
-                cache: client.cache.clone(),
-                shard_manager: client.shard_manager.clone(),
-            });
-            tokio::spawn(async move {
-                if let Err(e) = client.start().await {
-                    tracing::error!("Discord client stopped: {e}");
-                }
-            });
+    let bot_task = match config.discord_token.as_deref() {
+        Some(token) => match bot::build_client(token, state.clone()).await {
+            Ok((mut client, intents)) => {
+                let _ = state.discord.set(DiscordHandle {
+                    http: client.http.clone(),
+                    cache: client.cache.clone(),
+                    shard_manager: client.shard_manager.clone(),
+                    intents,
+                });
+                let task_state = state.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) = client.start().await {
+                        let reason = bot::describe_stop(&e);
+                        tracing::error!("{reason}");
+                        task_state.set_bot_error(reason);
+                    }
+                }))
+            }
+            Err(e) => {
+                // Keep the dashboard up so the problem is visible there instead of a restart loop.
+                tracing::error!("Discord bot not started: {e:#}");
+                state.set_bot_error(format!("{e:#}"));
+                None
+            }
+        },
+        None => {
+            tracing::warn!("DISCORD_TOKEN is not set, running the dashboard only");
+            None
         }
-        None => tracing::warn!("DISCORD_TOKEN is not set, running the dashboard only"),
-    }
+    };
 
     web::serve(state.clone(), shutdown_signal()).await?;
 
-    if let Some(discord) = state.discord() {
+    // Shards of a client that already stopped cannot be told to shut down.
+    if let (Some(discord), Some(task)) = (state.discord(), &bot_task)
+        && !task.is_finished()
+    {
         discord.shard_manager.shutdown_all().await;
     }
     tracing::info!("bye");

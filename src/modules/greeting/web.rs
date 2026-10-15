@@ -4,6 +4,7 @@ use axum::response::{Html, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use serde::Deserialize;
+use serenity::all::GatewayIntents;
 
 use super::template::{MAX_TEMPLATE_LEN, PLACEHOLDERS, Vars};
 use super::{
@@ -83,6 +84,16 @@ async fn page(
     }
 
     let mut warnings = Vec::new();
+    if !state
+        .missing_intents(GatewayIntents::GUILD_MEMBERS)
+        .is_empty()
+    {
+        warnings.push(
+            "Server Members Intent is disabled in the Discord developer portal, so the bot does not \
+             see members joining and no greetings are sent. Enable it on the Bot tab of your \
+             application and restart the bot.",
+        );
+    }
     match channels.iter().find(|c| c.selected) {
         None if selected.is_some() => {
             warnings.push("The configured channel no longer exists. Pick a new one.")

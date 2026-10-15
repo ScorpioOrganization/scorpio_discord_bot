@@ -55,6 +55,16 @@ Open http://localhost:8080 and sign in as `root`. Without `DISCORD_TOKEN` the da
 - Every account can view statistics and change bot settings. Only root manages accounts.
 - Forgot the root password? Run `scorpio-discord-bot reset-root` (Docker: `docker compose run --rm bot reset-root`). It prints a new password and signs root out everywhere.
 
+### Troubleshooting
+
+- **`Disallowed intent(s)` / close code 4014, or a "Server Members Intent is disabled" warning**: the
+  Greeting module needs the privileged Server Members Intent. Enable it on the **Bot** tab of your
+  application in the developer portal, then `docker compose restart bot`. Until then the bot still
+  connects, but without that intent, so members joining are not seen and no greetings are sent. The
+  dashboard shows the same warning on the overview, server and Greeting pages.
+- **`DISCORD_TOKEN was rejected by Discord`**: the token is wrong or was reset. Copy a new one from
+  the **Bot** tab into `.env` and restart. The dashboard keeps running and shows the error.
+
 ## Greeting module
 
 Configured per server under **Overview > server > Greeting**:
