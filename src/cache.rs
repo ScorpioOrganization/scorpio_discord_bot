@@ -39,6 +39,14 @@ impl TtlCache {
         self.lock().retain(|k, _| !k.starts_with(prefix));
     }
 
+    /// Makes every entry look `by` older, to test expiry without waiting.
+    #[cfg(test)]
+    pub fn backdate(&self, by: Duration) {
+        for (at, _) in self.lock().values_mut() {
+            *at = at.checked_sub(by).unwrap_or(*at);
+        }
+    }
+
     /// Drops entries older than `max_age`.
     pub fn prune(&self, max_age: Duration) {
         self.lock().retain(|_, (at, _)| at.elapsed() <= max_age);

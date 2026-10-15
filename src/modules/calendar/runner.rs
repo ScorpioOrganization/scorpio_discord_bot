@@ -213,12 +213,7 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
         .map(Rule::horizon_secs)
         .max()
         .unwrap_or_default();
-    let max_age = if due_digests.is_empty() {
-        events::MAX_AGE
-    } else {
-        events::FRESH
-    };
-    let fetched = match events::cached(state, guild_id, &cfg, now, horizon, max_age).await? {
+    let fetched = match events::cached(state, guild_id, &cfg, now, horizon, events::FRESH).await? {
         Ok(f) => f,
         Err(e) => {
             // Digests stay pending and are retried next minute until the grace runs out.
@@ -245,6 +240,14 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
         // Marked handled even when Discord refused, so a broken channel is not retried
         // every minute. The failure is in the log.
         set_last_run(&state.db, rule.id, occurrence).await?;
+        tracing::info!(
+            guild_id,
+            rule = %rule.name,
+            events = window.len(),
+            posted = out.posted,
+            failed = out.failed,
+            "calendar digest"
+        );
         record(state, guild_id, rule, window.len(), out, false).await?;
     }
 
@@ -265,6 +268,13 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
             let msg = render::event_message(rule, ev, &ctx);
             let out = post_all(outbox, channel, std::slice::from_ref(&msg)).await;
             mark_sent(&state.db, rule.id, &ev.task_id, ev.at).await?;
+            tracing::info!(
+                guild_id,
+                rule = %rule.name,
+                task = %ev.task_id,
+                ok = out.failed == 0,
+                "calendar reminder"
+            );
             record(state, guild_id, rule, 1, out, false).await?;
             handled += 1;
         }
@@ -660,6 +670,28 @@ pub mod tests {
             .await
             .unwrap();
         assert!(s.outbox.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tasks_added_after_the_last_read_are_seen_within_a_minute() {
+        let s = setup().await;
+        add_rule(&s, &reminder()).await;
+        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        let reads = s.mock.requests().len();
+
+        // Someone adds a meeting starting in 5 minutes right after the bot read the list.
+        s.mock.set_tasks(
+            mock::LIST_ID,
+            vec![task_at("new", "Quick sync", NINE + 360)],
+        );
+        run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
+        assert!(s.outbox.take().is_empty(), "the last read is still fresh");
+        assert_eq!(s.mock.requests().len(), reads);
+
+        // A minute later the bot reads again and reminds.
+        s.state.cache.backdate(std::time::Duration::from_secs(60));
+        run(&s.state, GUILD_ID, NINE + 60, &s.outbox).await.unwrap();
+        assert_eq!(s.outbox.take().len(), 1);
     }
 
     #[tokio::test]

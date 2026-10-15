@@ -18,7 +18,7 @@ use super::schedule::{self, DAY_NAMES};
 use super::{
     CalendarConfig, ID, Kind, Layout, LogRow, MAX_RULES, MAX_TEMPLATE_LEN, Rule, count_rules,
     delete_rule, insert_rule, list_rules, load_config, load_rule, parse_tags, recent_log,
-    save_config, update_rule,
+    save_config, update_rule, was_sent,
 };
 use crate::auth::extract::CurrentUser;
 use crate::bot::info::{self, ChannelOption, GuildSummary};
@@ -192,6 +192,12 @@ struct UpcomingRow {
     title: String,
     url: String,
     people: String,
+    /// The event already started (shown for the last 12 hours).
+    passed: bool,
+    /// 04:00 sharp, which is how ClickUp stores a date without a time.
+    maybe_no_time: bool,
+    /// One line per active reminder rule: when it reminds, or why it will not.
+    reminders: Vec<String>,
 }
 
 struct RuleRow {
@@ -229,6 +235,7 @@ struct CalendarPage {
     list_outside_catalog: bool,
     tz_names: &'static [String],
     upcoming: Vec<UpcomingRow>,
+    show_reminders: bool,
     upcoming_error: Option<String>,
     truncated: bool,
     rules: Vec<RuleRow>,
@@ -350,6 +357,10 @@ async fn page(
             .iter()
             .any(|g| g.lists.iter().any(|l| l.selected));
 
+    let reminder_rules: Vec<&Rule> = rules
+        .iter()
+        .filter(|r| r.enabled && r.kind == Kind::Reminder && r.channel_id.is_some())
+        .collect();
     let mut upcoming = Vec::new();
     let mut upcoming_error = None;
     let mut truncated = false;
@@ -358,7 +369,7 @@ async fn page(
             Ok(fetched) => {
                 truncated = fetched.truncated;
                 let list: Vec<_> = fetched
-                    .between(now, now + UPCOMING_SECS)
+                    .between(now - events::LOOKBACK_SECS, now + UPCOMING_SECS)
                     .into_iter()
                     .take(UPCOMING_MAX)
                     .collect();
@@ -367,9 +378,23 @@ async fn page(
                 let members = crate::bot::members::guild_members(&state, gid).await;
                 let names: HashMap<u64, &str> =
                     members.iter().map(|m| (m.id, m.display())).collect();
-                upcoming = list
-                    .into_iter()
-                    .map(|e| UpcomingRow {
+                for e in list {
+                    let passed = e.at <= now;
+                    let mut reminders = Vec::new();
+                    for rule in &reminder_rules {
+                        let remind_at = e.at - i64::from(rule.lead_minutes) * 60;
+                        let status = if was_sent(&state.db, rule.id, &e.task_id, e.at).await? {
+                            "sent".to_owned()
+                        } else if passed {
+                            "not sent, the bot did not see it before it started".to_owned()
+                        } else if remind_at <= now {
+                            "due now, posted within a minute".to_owned()
+                        } else {
+                            format!("at {}", schedule::fmt_local(remind_at, &tz))
+                        };
+                        reminders.push(format!("{}: {status}", rule.name));
+                    }
+                    upcoming.push(UpcomingRow {
                         at: e.at,
                         time: schedule::fmt_local(e.at, &tz),
                         people: e
@@ -383,14 +408,18 @@ async fn page(
                             })
                             .collect::<Vec<_>>()
                             .join(", "),
+                        passed,
+                        maybe_no_time: schedule::fmt_local_as(e.at, &tz, "%H:%M:%S") == "04:00:00",
+                        reminders,
                         title: e.name,
                         url: e.url,
-                    })
-                    .collect();
+                    });
+                }
             }
             Err(e) => upcoming_error = Some(e.message()),
         }
     }
+    let show_reminders = !reminder_rules.is_empty();
 
     let rule_rows = rules
         .iter()
@@ -429,6 +458,7 @@ async fn page(
         list_outside_catalog,
         tz_names: schedule::tz_names(),
         upcoming,
+        show_reminders,
         upcoming_error,
         truncated,
         rules: rule_rows,

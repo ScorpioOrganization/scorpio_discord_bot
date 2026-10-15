@@ -12,10 +12,13 @@ use crate::state::AppState;
 pub const MAX_PAGES: u32 = 5;
 /// Always fetch at least this far ahead, so the dashboard's upcoming list is covered too.
 pub const MIN_HORIZON_SECS: i64 = 7 * 86400;
-/// Normal reuse window for fetched events.
+/// Reuse window for the dashboard.
 pub const MAX_AGE: Duration = Duration::from_secs(5 * 60);
-/// Reuse window right before posting a digest.
-pub const FRESH: Duration = Duration::from_secs(60);
+/// Reuse window for posting: events created or moved shortly before their reminder must
+/// still be seen, so the bot reads ClickUp about once a minute while a rule needs it.
+pub const FRESH: Duration = Duration::from_secs(55);
+/// Events that started this long ago are still read, so the dashboard can show them.
+pub const LOOKBACK_SECS: i64 = 12 * 3600;
 /// In start date mode a task may start in the window but be due later.
 const START_MODE_SPAN_SECS: i64 = 31 * 86400;
 
@@ -218,7 +221,14 @@ pub async fn cached(
         return Ok(Ok(hit));
     }
     // Fetch a little further than needed so the next minutes are still covered.
-    let fetched = fetch(state, guild_id, cfg, now, now + horizon + 3600).await?;
+    let fetched = fetch(
+        state,
+        guild_id,
+        cfg,
+        now - LOOKBACK_SECS,
+        now + horizon + 3600,
+    )
+    .await?;
     Ok(fetched.map(|f| state.cache.insert(key, f)))
 }
 

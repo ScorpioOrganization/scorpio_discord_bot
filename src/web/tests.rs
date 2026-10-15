@@ -968,13 +968,29 @@ async fn calendar_page_lists_upcoming_events_and_rules() {
     shared_clickup_key(&app, &cookie, &csrf).await;
     select_list(&app, &cookie, &csrf).await;
 
-    let soon = (crate::db::now() + 3600) * 1000;
-    let mut task = mock::task("t1", "Sprint <review>", Some(soon));
+    let now = crate::db::now();
+    let mut task = mock::task("t1", "Sprint <review>", Some((now + 3600) * 1000));
     task["assignees"] = serde_json::json!([
         {"id": 3, "username": "Anna Nowak", "email": "a@x.io"},
         {"id": 9, "username": "Guest", "email": "g@x.io"}
     ]);
-    app.clickup.set_tasks(mock::LIST_ID, vec![task]);
+    // A date without a time: ClickUp stores 04:00 local time.
+    let tz = jiff::tz::TimeZone::get("Europe/Warsaw").unwrap();
+    let tomorrow = jiff::Timestamp::now()
+        .to_zoned(tz.clone())
+        .date()
+        .tomorrow()
+        .unwrap();
+    let four = tomorrow.at(4, 0, 0, 0).to_zoned(tz).unwrap().timestamp();
+    app.clickup.set_tasks(
+        mock::LIST_ID,
+        vec![
+            task,
+            mock::task("done", "Reminded", Some((now - 3600) * 1000)),
+            mock::task("late", "Missed it", Some((now - 7200) * 1000)),
+            mock::task("allday", "Offsite", Some(four.as_millisecond())),
+        ],
+    );
     let form = [("_csrf", csrf.as_str())];
     let res = app
         .post(&calendar_path("/refresh"), Some(&cookie), &form)
@@ -983,7 +999,10 @@ async fn calendar_page_lists_upcoming_events_and_rules() {
 
     let mut rule = Rule::new(Kind::Reminder);
     rule.channel_id = Some(VOICE_CHANNEL_ID);
-    calendar::insert_rule(&app.state.db, GUILD_ID, &rule, "root")
+    let rid = calendar::insert_rule(&app.state.db, GUILD_ID, &rule, "root")
+        .await
+        .unwrap();
+    calendar::mark_sent(&app.state.db, rid, "done", now - 3600)
         .await
         .unwrap();
 
@@ -1000,6 +1019,16 @@ async fn calendar_page_lists_upcoming_events_and_rules() {
         page.body.contains("The channel of rule"),
         "voice channel is not a text channel"
     );
+    // Recently started events are listed, with what each reminder rule did or will do.
+    assert!(page.body.contains("Reminded"));
+    assert!(page.body.contains("Event reminder: sent"));
+    assert!(
+        page.body
+            .contains("Event reminder: not sent, the bot did not see it")
+    );
+    assert!(page.body.contains("Event reminder: at "));
+    assert_eq!(page.body.matches(">started<").count(), 2);
+    assert_eq!(page.body.matches("no time set in ClickUp?").count(), 1);
 }
 
 #[tokio::test]

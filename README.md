@@ -86,7 +86,12 @@ Open http://localhost:8080 and sign in as `root`. Without `DISCORD_TOKEN` the da
   list is selected, the API key works (the key card shows the last error; with the shared key the
   ClickUp module must be enabled too), the rule is active and has a channel the bot can post in, and
   the events have the date the calendar uses (due date, or start date in start date mode). The
-  **Recent activity** table and the **Upcoming** list on the Calendar page show what the bot sees.
+  **Events** table on the Calendar page lists what the bot reads (including the last 12 hours) and,
+  for every reminder rule, when it reminds or why it did not; **Recent activity** shows every post.
+- **A task is listed but never reminded**: give it a due date *with a time*. ClickUp stores a date
+  without a time as 04:00 in the time zone of whoever set it, so for the bot that event already
+  started early in the morning. The Events table marks such tasks with "no time set in ClickUp?".
+  This works the same on every ClickUp plan, including Free Forever.
 
 ## Greeting module
 
@@ -164,6 +169,8 @@ Behavior worth knowing:
 - A digest that could not be posted within 2 hours of its time (bot offline, ClickUp down) is skipped and shown as missed, not posted late.
 - If Discord refuses a message (missing permission, deleted channel) it is logged and counted, and not retried every minute. A reaction that cannot be added does not make the post count as failed.
 - At most 10 reminders per rule are posted per minute, so a backlog cannot flood a channel.
+- While a reminder rule exists the bot reads the list about once a minute, so new or moved tasks are noticed within a minute. A task created after its reminder time but before it starts is reminded right away; one that already started is not.
+- Reminders need a due time. A ClickUp date without a time is stored as 04:00, see Troubleshooting.
 - Tasks are read in pages; if a list has more than about 500 matching tasks in the time window, some can be missed and the page says so. A tag filter helps.
 - The page shows the upcoming events of the next 7 days with matched members, each rule's next run, statistics (digests, reminders, failed posts, missed digests, ClickUp errors) and recent activity. The rule page shows a preview of what would be posted now and has a **Send test message** button.
 

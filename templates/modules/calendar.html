@@ -144,7 +144,7 @@
 
 <section class="card">
   <div class="label-row">
-    <h2>Upcoming, next 7 days</h2>
+    <h2>Events, last 12 hours and next 7 days</h2>
     <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/refresh">
       <input type="hidden" name="_csrf" value="{{ page.csrf }}">
       <button class="btn btn-ghost btn-sm" type="submit">Refresh from ClickUp</button>
@@ -153,17 +153,24 @@
   {% if let Some(err) = upcoming_error %}
   <div class="callout callout-err small">{{ err }}</div>
   {% else if upcoming.is_empty() %}
-  <p class="muted">Nothing scheduled.</p>
+  <p class="muted">No task in this list has a {% if start_mode() %}start or due{% else %}due{% endif %} date between 12 hours ago and 7 days from now.</p>
   {% else %}
   <div class="table-wrap">
     <table class="table">
-      <thead><tr><th>When</th><th>Event</th><th>Assignees</th></tr></thead>
+      <thead><tr><th>When</th><th>Event</th><th>Assignees</th>{% if show_reminders %}<th>Reminders</th>{% endif %}</tr></thead>
       <tbody>
       {% for e in upcoming %}
       <tr>
-        <td><time data-ts="{{ e.at }}">{{ e.time }}</time></td>
+        <td>
+          <time data-ts="{{ e.at }}">{{ e.time }}</time>
+          {% if e.passed %}<br><span class="badge badge-muted">started</span>{% endif %}
+          {% if e.maybe_no_time %}<br><span class="badge badge-warn">no time set in ClickUp?</span>{% endif %}
+        </td>
         <td>{% if e.url.starts_with("https://") %}<a href="{{ e.url }}" target="_blank" rel="noopener noreferrer">{{ e.title }}</a>{% else %}{{ e.title }}{% endif %}</td>
         <td class="small">{{ e.people }}</td>
+        {% if show_reminders %}
+        <td class="small">{% for line in e.reminders %}{{ line }}{% if !loop.last %}<br>{% endif %}{% endfor %}</td>
+        {% endif %}
       </tr>
       {% endfor %}
       </tbody>
@@ -171,6 +178,7 @@
   </div>
   {% if truncated %}<p class="hint">The list has more tasks than one read covers, some events may be missing. A tag filter helps.</p>{% endif %}
   {% endif %}
+  <p class="hint">Reminders need a date with a time. ClickUp stores a date without a time as 04:00 in the time zone of whoever set it, so such a task already "started" in the early morning and is never reminded. Times here use the time zone from Source; a new or moved task is picked up within a minute.</p>
 </section>
 
 <section class="card">
