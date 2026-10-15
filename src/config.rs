@@ -10,6 +10,9 @@ pub struct Config {
     pub cookie_secure: bool,
     pub trust_proxy: bool,
     pub root_password: Option<String>,
+    /// 64 hex characters used to encrypt stored API keys. When unset a key file is created
+    /// next to the database (see `secrets::Vault::load`).
+    pub secrets_key: Option<String>,
 }
 
 impl Config {
@@ -29,6 +32,7 @@ impl Config {
             cookie_secure: flag("COOKIE_SECURE"),
             trust_proxy: flag("TRUST_PROXY"),
             root_password: non_empty("ROOT_PASSWORD"),
+            secrets_key: non_empty("SECRETS_KEY"),
         })
     }
 }

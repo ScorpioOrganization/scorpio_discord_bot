@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}Calendar | {{ guild.name }}{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <span>Calendar</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>Calendar</h1>
+    <p class="muted">Agendas and reminders of meetings and events from a ClickUp list. The bot only reads ClickUp.</p>
+  </div>
+  <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/toggle" class="toggle-form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <input type="hidden" name="back" value="module">
+    {% if enabled %}
+    <span class="badge badge-on">Enabled</span>
+    <input type="hidden" name="enabled" value="0">
+    <button class="btn btn-ghost" type="submit">Disable</button>
+    {% else %}
+    <span class="badge badge-off">Disabled</span>
+    <input type="hidden" name="enabled" value="1">
+    <button class="btn btn-primary" type="submit">Enable</button>
+    {% endif %}
+  </form>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <div class="stack">
+    {% include "clickup/token_card.html" %}
+
+    <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/calendar">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <h2>Source</h2>
+      {% if let Some(err) = catalog_error %}
+      <div class="callout callout-err small">Could not load your ClickUp lists: {{ err }}</div>
+      {% endif %}
+      <label>
+        <span>ClickUp list (the board with your events)</span>
+        <select name="list_select">
+          <option value="">{% if catalog.is_empty() %}Save an API key to pick a list{% else %}None{% endif %}</option>
+          {% if list_outside_catalog %}
+          <option value="{{ list_id() }}" selected>{{ list_name() }}</option>
+          {% endif %}
+          {% for g in catalog %}
+          <optgroup label="{{ g.label }}">
+            {% for l in g.lists %}
+            <option value="{{ l.id }}"{% if l.selected %} selected{% endif %}>{{ l.name }}</option>
+            {% endfor %}
+          </optgroup>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Or list ID / list URL</span>
+        <input type="text" name="list_manual" placeholder="901234567 or https://app.clickup.com/.../li/901234567" autocomplete="off">
+      </label>
+      <label>
+        <span>Event time</span>
+        <select name="time_field">
+          <option value="due"{% if !start_mode() %} selected{% endif %}>Due date</option>
+          <option value="start"{% if start_mode() %} selected{% endif %}>Start date (due date if no start)</option>
+        </select>
+      </label>
+      <label>
+        <span>Time zone for digest schedules</span>
+        <input type="text" name="timezone" value="{{ cfg.timezone }}" list="time-zones" required autocomplete="off">
+      </label>
+      <datalist id="time-zones">
+        {% for name in tz_names %}<option value="{{ name }}">{% endfor %}
+      </datalist>
+      <label>
+        <span>Only tasks with one of these tags (comma separated, optional)</span>
+        <input type="text" name="tag_filter" value="{{ cfg.tag_filter }}" placeholder="meeting, event" autocomplete="off">
+      </label>
+      <label class="check">
+        <input type="checkbox" name="include_subtasks"{% if cfg.include_subtasks %} checked{% endif %}>
+        <span>Include subtasks</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="include_closed"{% if cfg.include_closed %} checked{% endif %}>
+        <span>Include closed tasks</span>
+      </label>
+      <p class="hint">Tasks without the chosen date are ignored. Times in Discord show in each reader's own time zone.</p>
+      <div class="actions"><button class="btn btn-primary" type="submit">Save source</button></div>
+    </form>
+  </div>
+
+  <div class="stack">
+    <section class="card">
+      <div class="label-row">
+        <h2>Notification rules</h2>
+      </div>
+      {% if rules.is_empty() %}
+      <p class="muted">No rules yet. A digest posts an agenda on a schedule, a reminder posts before each event.</p>
+      {% else %}
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Rule</th><th>Channel</th><th>When</th></tr></thead>
+          <tbody>
+          {% for r in rules %}
+          <tr>
+            <td>
+              <a href="/guilds/{{ guild.id }}/modules/calendar/rules/{{ r.id }}">{{ r.name }}</a>
+              <br><span class="badge badge-muted">{{ r.kind }}</span>
+              {% if !r.enabled %}<span class="badge badge-off">off</span>{% endif %}
+            </td>
+            <td>{{ r.channel }}</td>
+            <td class="small">
+              {{ r.schedule }}
+              {% if r.next_run.is_some() %}<br><span class="muted">Next: <time data-ts="{{ r.next_ts() }}">{{ r.next_text() }}</time></span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+      {% if can_add_rule %}
+      <div class="actions">
+        <a class="btn btn-secondary" href="/guilds/{{ guild.id }}/modules/calendar/rules/new?kind=digest">New digest</a>
+        <a class="btn btn-secondary" href="/guilds/{{ guild.id }}/modules/calendar/rules/new?kind=reminder">New reminder</a>
+      </div>
+      {% else %}
+      <p class="hint">The maximum number of rules is reached.</p>
+      {% endif %}
+    </section>
+
+    <section class="stats-grid">
+      <div class="stat"><span class="stat-label">Digests sent</span><span class="stat-value">{{ digests }}</span></div>
+      <div class="stat"><span class="stat-label">Reminders sent</span><span class="stat-value">{{ reminders }}</span></div>
+      <div class="stat"><span class="stat-label">Failed posts</span><span class="stat-value{% if failed > 0 %} text-err{% endif %}">{{ failed }}</span></div>
+      <div class="stat"><span class="stat-label">Missed digests</span><span class="stat-value{% if missed > 0 %} text-err{% endif %}">{{ missed }}</span></div>
+      <div class="stat"><span class="stat-label">ClickUp errors</span><span class="stat-value{% if api_err > 0 %} text-err{% endif %}">{{ api_err }}</span></div>
+    </section>
+  </div>
+</div>
+
+<section class="card">
+  <div class="label-row">
+    <h2>Upcoming, next 7 days</h2>
+    <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/refresh">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-ghost btn-sm" type="submit">Refresh from ClickUp</button>
+    </form>
+  </div>
+  {% if let Some(err) = upcoming_error %}
+  <div class="callout callout-err small">{{ err }}</div>
+  {% else if upcoming.is_empty() %}
+  <p class="muted">Nothing scheduled.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>When</th><th>Event</th><th>Assignees</th></tr></thead>
+      <tbody>
+      {% for e in upcoming %}
+      <tr>
+        <td><time data-ts="{{ e.at }}">{{ e.time }}</time></td>
+        <td>{% if e.url.starts_with("https://") %}<a href="{{ e.url }}" target="_blank" rel="noopener noreferrer">{{ e.title }}</a>{% else %}{{ e.title }}{% endif %}</td>
+        <td class="small">{{ e.people }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if truncated %}<p class="hint">The list has more tasks than one read covers, some events may be missing. A tag filter helps.</p>{% endif %}
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Recent activity</h2>
+  {% if recent.is_empty() %}
+  <p class="muted">Nothing yet. Posts and test messages will show up here.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Time</th><th>Rule</th><th>Events</th><th>Result</th></tr></thead>
+      <tbody>
+      {% for r in recent %}
+      <tr>
+        <td><time data-ts="{{ r.timestamp() }}">{{ r.time() }}</time></td>
+        <td>{{ r.rule_name }} <span class="badge badge-muted">{{ r.kind_label() }}</span>{% if r.is_test %} <span class="badge badge-muted">test</span>{% endif %}</td>
+        <td>{{ r.events }}</td>
+        <td>
+          {% if !r.success %}
+          <span class="badge badge-err" title="{{ r.error_text() }}">Failed</span>
+          {% else if r.error.is_some() %}
+          <span class="badge badge-warn" title="{{ r.error_text() }}">Posted, with a warning</span>
+          {% else if r.events == 0 && !r.is_test %}
+          <span class="badge badge-muted">Nothing to post</span>
+          {% else %}
+          <span class="badge badge-on">Posted</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

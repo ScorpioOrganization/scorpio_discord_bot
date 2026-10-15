@@ -1,9 +1,12 @@
 mod auth;
 mod bot;
+mod cache;
+mod clickup;
 mod config;
 mod db;
 mod error;
 mod modules;
+mod secrets;
 mod state;
 #[cfg(test)]
 mod test_util;
@@ -50,7 +53,8 @@ async fn main() -> Result<()> {
         tracing::warn!("COOKIE_SECURE is off. Turn it on when the dashboard is served over HTTPS.");
     }
 
-    let state = AppState::new(db, config.clone(), modules::registry());
+    let vault = secrets::Vault::load(&config)?;
+    let state = AppState::new(db, config.clone(), modules::registry(), vault);
     tokio::spawn(maintenance(state.clone()));
 
     let bot_task = match config.discord_token.as_deref() {
@@ -62,6 +66,7 @@ async fn main() -> Result<()> {
                     shard_manager: client.shard_manager.clone(),
                     intents,
                 });
+                tokio::spawn(bot::scheduler::run(state.clone()));
                 let task_state = state.clone();
                 Some(tokio::spawn(async move {
                     if let Err(e) = client.start().await {
@@ -107,7 +112,12 @@ async fn maintenance(state: AppState) {
         if let Err(e) = modules::greeting::prune_log(&state.db).await {
             tracing::error!("greeting log cleanup failed: {e:#}");
         }
+        if let Err(e) = modules::calendar::prune(&state.db).await {
+            tracing::error!("calendar log cleanup failed: {e:#}");
+        }
         state.limiter.prune();
+        state.members.prune();
+        state.cache.prune(Duration::from_secs(3600));
     }
 }
 

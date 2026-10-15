@@ -1,5 +1,7 @@
 //! Placeholder substitution for greeting messages.
 
+use crate::modules::text::{self, escape_markdown, truncate_chars};
+
 pub const DEFAULT_TEMPLATE: &str =
     "Welcome to **{server}**, {user}! You are member #{member_count}.";
 pub const MAX_TEMPLATE_LEN: usize = 1500;
@@ -27,23 +29,10 @@ pub struct Vars {
 /// Replaces known `{placeholder}` tokens. Unknown tokens are left untouched.
 /// Names are markdown escaped so odd nicknames cannot break the message formatting.
 pub fn render(template: &str, vars: &Vars) -> String {
-    let mut out = String::with_capacity(template.len() + 64);
-    let mut rest = template;
-
-    while let Some(start) = rest.find('{') {
-        let Some(len) = rest[start..].find('}') else {
-            break;
-        };
-        let end = start + len;
-        out.push_str(&rest[..start]);
-        match replacement(&rest[start + 1..end], vars) {
-            Some(value) => out.push_str(&value),
-            None => out.push_str(&rest[start..=end]),
-        }
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    truncate(out, MAX_MESSAGE_LEN)
+    truncate_chars(
+        text::render(template, |token| replacement(token, vars)),
+        MAX_MESSAGE_LEN,
+    )
 }
 
 fn replacement(token: &str, vars: &Vars) -> Option<String> {
@@ -56,27 +45,6 @@ fn replacement(token: &str, vars: &Vars) -> Option<String> {
         "member_count" => vars.member_count.to_string(),
         _ => return None,
     })
-}
-
-pub fn escape_markdown(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(
-            c,
-            '\\' | '*' | '_' | '~' | '`' | '|' | '>' | '#' | '[' | ']' | '(' | ')'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn truncate(mut s: String, max_chars: usize) -> String {
-    if let Some((idx, _)) = s.char_indices().nth(max_chars) {
-        s.truncate(idx);
-    }
-    s
 }
 
 #[cfg(test)]

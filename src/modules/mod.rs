@@ -1,4 +1,7 @@
+pub mod calendar;
+pub mod clickup;
 pub mod greeting;
+pub mod text;
 
 use std::sync::Arc;
 
@@ -9,7 +12,7 @@ use serenity::all::{Context, GatewayIntents, Member};
 use sqlx::SqlitePool;
 
 use crate::db::sf;
-use crate::state::AppState;
+use crate::state::{AppState, DiscordHandle};
 
 /// A bot feature that can be switched on or off per guild from the dashboard.
 ///
@@ -41,6 +44,22 @@ pub trait Module: Send + Sync + 'static {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Whether [`on_tick`](Self::on_tick) should be called. Off by default.
+    fn ticks(&self) -> bool {
+        false
+    }
+
+    /// Periodic work, called by `bot::scheduler` about once a minute for every guild the
+    /// module is enabled in, while the bot is connected.
+    async fn on_tick(
+        &self,
+        _state: &AppState,
+        _discord: &DiscordHandle,
+        _guild_id: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct StatItem {
@@ -58,7 +77,11 @@ impl StatItem {
 }
 
 pub fn registry() -> Vec<Arc<dyn Module>> {
-    vec![Arc::new(greeting::GreetingModule)]
+    vec![
+        Arc::new(greeting::GreetingModule),
+        Arc::new(clickup::ClickUpModule),
+        Arc::new(calendar::CalendarModule),
+    ]
 }
 
 pub async fn is_enabled(db: &SqlitePool, guild_id: u64, module_id: &str) -> Result<bool> {
@@ -88,6 +111,17 @@ pub async fn set_enabled(
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Guilds a module is switched on in, whether or not the bot is still a member.
+pub async fn enabled_guilds(db: &SqlitePool, module_id: &str) -> Result<Vec<u64>> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT guild_id FROM guild_modules WHERE module_id = ? AND enabled = 1 ORDER BY guild_id",
+    )
+    .bind(module_id.to_owned())
+    .fetch_all(db)
+    .await?;
+    Ok(ids.into_iter().map(|id| id as u64).collect())
 }
 
 pub async fn enabled_count(db: &SqlitePool, guild_id: u64) -> Result<i64> {
@@ -165,9 +199,14 @@ mod tests {
         assert!(!is_enabled(&db, 2, "greeting").await.unwrap());
         assert_eq!(enabled_count(&db, 1).await.unwrap(), 2);
 
+        set_enabled(&db, 3, "greeting", true).await.unwrap();
+        assert_eq!(enabled_guilds(&db, "greeting").await.unwrap(), [1, 3]);
+
         set_enabled(&db, 1, "greeting", false).await.unwrap();
         assert!(!is_enabled(&db, 1, "greeting").await.unwrap());
         assert_eq!(enabled_count(&db, 1).await.unwrap(), 1);
+        assert_eq!(enabled_guilds(&db, "greeting").await.unwrap(), [3]);
+        assert_eq!(enabled_guilds(&db, "other").await.unwrap(), [1]);
     }
 
     #[tokio::test]
@@ -197,6 +236,7 @@ mod tests {
         bump_counter(&db, gid, "greeting", "sent").await.unwrap();
         assert!(is_enabled(&db, gid, "greeting").await.unwrap());
         assert!(!is_enabled(&db, gid - 1, "greeting").await.unwrap());
+        assert_eq!(enabled_guilds(&db, "greeting").await.unwrap(), [gid]);
         assert_eq!(
             counter(&db, Some(gid), "greeting", "sent").await.unwrap(),
             1

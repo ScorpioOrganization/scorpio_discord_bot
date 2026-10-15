@@ -14,7 +14,7 @@ use super::{
 use crate::auth::extract::CurrentUser;
 use crate::bot::info::{self, ChannelOption, GuildSummary};
 use crate::error::{AppError, AppResult};
-use crate::modules;
+use crate::modules::{self, text};
 use crate::state::AppState;
 use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_guild};
 
@@ -171,7 +171,7 @@ async fn save(
         return Ok(redirect_msg(&back, "template_long"));
     }
 
-    let Some(embed_color) = parse_color(&form.embed_color) else {
+    let Some(embed_color) = text::parse_hex_color(&form.embed_color) else {
         return Ok(redirect_msg(&back, "invalid_color"));
     };
 
@@ -185,14 +185,6 @@ async fn save(
     save_config(&state.db, gid, &cfg, &user.username).await?;
     tracing::info!(user = %user.username, guild_id = gid, "greeting settings saved");
     Ok(redirect_msg(&back, "saved"))
-}
-
-fn parse_color(raw: &str) -> Option<u32> {
-    let hex = raw.trim().strip_prefix('#')?;
-    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    u32::from_str_radix(hex, 16).ok()
 }
 
 /// Sends the configured greeting using the bot itself as the sample member. Nobody is pinged.
@@ -234,19 +226,4 @@ async fn send_test(
             "test_failed"
         },
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_color;
-
-    #[test]
-    fn colors() {
-        assert_eq!(parse_color("#7f8cff"), Some(0x7f8cff));
-        assert_eq!(parse_color(" #000000 "), Some(0));
-        assert_eq!(parse_color("7f8cff"), None);
-        assert_eq!(parse_color("#fff"), None);
-        assert_eq!(parse_color("#gggggg"), None);
-        assert_eq!(parse_color("#+12345"), None);
-    }
 }

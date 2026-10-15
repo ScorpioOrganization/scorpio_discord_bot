@@ -1,7 +1,14 @@
 use axum::http::{Method, StatusCode, header};
 
 use crate::auth::ROOT_USERNAME;
-use crate::test_util::{IP, ROOT_PW, TestApp, TestResponse};
+use crate::clickup::mapping::Explicit;
+use crate::clickup::{mock, tokens};
+use crate::modules::calendar::{self, Kind, Rule};
+use crate::modules::clickup::explicit_mappings;
+use crate::test_util::{
+    CHANNEL_ID, EMOJI_ID, GUILD_ID, GUILD_NAME, IP, MEMBER_ID, ROOT_PW, TestApp, TestResponse,
+    VOICE_CHANNEL_ID,
+};
 
 const USER_PW: &str = "user-password-123";
 
@@ -319,7 +326,14 @@ async fn guild_routes_404_without_discord() {
     let cookie = app.login_root().await;
     let csrf = app.csrf(&cookie).await;
 
-    for path in ["/guilds/1", "/guilds/1/modules/greeting"] {
+    for path in [
+        "/guilds/1",
+        "/guilds/1/modules/greeting",
+        "/guilds/1/modules/clickup",
+        "/guilds/1/modules/calendar",
+        "/guilds/1/modules/calendar/rules/new?kind=digest",
+        "/guilds/1/modules/calendar/rules/1",
+    ] {
         let res = app.get(path, Some(&cookie)).await;
         assert_eq!(res.status, StatusCode::NOT_FOUND, "{path}");
     }
@@ -334,6 +348,37 @@ async fn guild_routes_404_without_discord() {
             ],
         ),
         ("/guilds/1/modules/greeting/test", vec![]),
+        ("/guilds/1/modules/clickup/toggle", vec![("enabled", "1")]),
+        (
+            "/guilds/1/modules/clickup/token",
+            vec![("token", mock::TOKEN)],
+        ),
+        ("/guilds/1/modules/clickup/token/delete", vec![]),
+        ("/guilds/1/modules/clickup/test", vec![]),
+        (
+            "/guilds/1/modules/clickup/workspace",
+            vec![("team_id", mock::TEAM_ID)],
+        ),
+        ("/guilds/1/modules/clickup/mapping", vec![("map_3", "-")]),
+        ("/guilds/1/modules/clickup/members/refresh", vec![]),
+        ("/guilds/1/modules/calendar/toggle", vec![("enabled", "1")]),
+        (
+            "/guilds/1/modules/calendar",
+            vec![("time_field", "due"), ("timezone", "UTC")],
+        ),
+        ("/guilds/1/modules/calendar/refresh", vec![]),
+        (
+            "/guilds/1/modules/calendar/token",
+            vec![("token", mock::TOKEN)],
+        ),
+        (
+            "/guilds/1/modules/calendar/token/source",
+            vec![("source", "own")],
+        ),
+        ("/guilds/1/modules/calendar/rules", vec![("kind", "digest")]),
+        ("/guilds/1/modules/calendar/rules/1", vec![("name", "x")]),
+        ("/guilds/1/modules/calendar/rules/1/delete", vec![]),
+        ("/guilds/1/modules/calendar/rules/1/test", vec![]),
     ];
     for (path, mut form) in posts {
         form.push(("_csrf", &csrf));
@@ -342,11 +387,17 @@ async fn guild_routes_404_without_discord() {
     }
     let db = &app.state.db;
     assert!(!crate::modules::is_enabled(db, 1, "greeting").await.unwrap());
-    let saved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM greeting_config")
-        .fetch_one(db)
-        .await
-        .unwrap();
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM greeting_config) + (SELECT COUNT(*) FROM clickup_tokens)
+              + (SELECT COUNT(*) FROM clickup_config) + (SELECT COUNT(*) FROM clickup_user_map)
+              + (SELECT COUNT(*) FROM clickup_token_source)
+              + (SELECT COUNT(*) FROM calendar_config) + (SELECT COUNT(*) FROM calendar_rules)",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
     assert_eq!(saved, 0);
+    assert!(app.clickup.requests().is_empty());
 }
 
 #[tokio::test]
@@ -376,4 +427,804 @@ async fn flash_ignores_unknown_codes() {
     assert_eq!(res.status, StatusCode::OK);
     assert!(!res.body.contains("alert(1)"));
     assert!(!res.body.contains(r#"class="flash"#));
+}
+
+#[tokio::test]
+async fn guild_pages_render_with_connected_bot() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+
+    let res = app.get("/", Some(&cookie)).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains(GUILD_NAME));
+
+    let res = app.get(&format!("/guilds/{GUILD_ID}"), Some(&cookie)).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains(GUILD_NAME));
+    assert!(
+        res.body
+            .contains(&format!("/guilds/{GUILD_ID}/modules/greeting"))
+    );
+
+    let res = app
+        .get(
+            &format!("/guilds/{GUILD_ID}/modules/greeting"),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("#events"));
+    assert!(
+        !res.body.contains("Voice"),
+        "only text channels are offered"
+    );
+
+    let res = app.get("/guilds/1/modules/greeting", Some(&cookie)).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn greeting_toggle_and_save() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let base = format!("/guilds/{GUILD_ID}/modules/greeting");
+    let db = &app.state.db;
+
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("enabled", "1"),
+        ("back", "module"),
+    ];
+    let res = app
+        .post(&format!("{base}/toggle"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), format!("{base}?msg=enabled"));
+    assert!(
+        crate::modules::is_enabled(db, GUILD_ID, "greeting")
+            .await
+            .unwrap()
+    );
+
+    let form = [("_csrf", csrf.as_str()), ("enabled", "0")];
+    let res = app
+        .post(&format!("{base}/toggle"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), format!("/guilds/{GUILD_ID}?msg=disabled"));
+
+    let channel = CHANNEL_ID.to_string();
+    let voice = VOICE_CHANNEL_ID.to_string();
+    let long = "x".repeat(1501);
+    let cases = [
+        (channel.as_str(), "Hi {user}", "#123456", "saved"),
+        (voice.as_str(), "Hi {user}", "#123456", "invalid_channel"),
+        ("", "   ", "#123456", "template_empty"),
+        ("", long.as_str(), "#123456", "template_long"),
+        ("", "Hi", "red", "invalid_color"),
+    ];
+    for (channel_id, template, color, code) in cases {
+        let form = [
+            ("_csrf", csrf.as_str()),
+            ("channel_id", channel_id),
+            ("template", template),
+            ("embed_color", color),
+            ("use_embed", "on"),
+        ];
+        let res = app.post(&base, Some(&cookie), &form).await;
+        assert_eq!(res.redirect(), format!("{base}?msg={code}"), "{code}");
+    }
+
+    let cfg = crate::modules::greeting::load_config(db, GUILD_ID)
+        .await
+        .unwrap();
+    assert_eq!(cfg.channel_id, Some(CHANNEL_ID as i64));
+    assert_eq!(cfg.template, "Hi {user}");
+    assert!(cfg.use_embed);
+    assert_eq!(cfg.embed_color, 0x123456);
+}
+
+const CLICKUP_ROUTES: [&str; 6] = [
+    "/token",
+    "/token/delete",
+    "/test",
+    "/workspace",
+    "/mapping",
+    "/members/refresh",
+];
+
+fn clickup_path(suffix: &str) -> String {
+    format!("/guilds/{GUILD_ID}/modules/clickup{suffix}")
+}
+
+/// Saves the mock's valid key through the dashboard.
+async fn save_clickup_key(app: &TestApp, cookie: &str, csrf: &str) {
+    let form = [("_csrf", csrf), ("token", mock::TOKEN)];
+    let res = app.post(&clickup_path("/token"), Some(cookie), &form).await;
+    assert_eq!(res.redirect(), clickup_path("?msg=token_saved"));
+}
+
+#[tokio::test]
+async fn clickup_routes_require_login_and_csrf() {
+    let app = TestApp::with_guild().await;
+    assert_eq!(app.get(&clickup_path(""), None).await.redirect(), "/login");
+    let cookie = app.login_root().await;
+    for suffix in CLICKUP_ROUTES {
+        let path = clickup_path(suffix);
+        assert_eq!(
+            app.post(&path, None, &[]).await.redirect(),
+            "/login",
+            "{path}"
+        );
+        let res = app
+            .post(&path, Some(&cookie), &[("token", mock::TOKEN)])
+            .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}");
+    }
+    // The shared key has no shared/own choice.
+    let csrf = app.csrf(&cookie).await;
+    let form = [("_csrf", csrf.as_str()), ("source", "own")];
+    let res = app
+        .post(&clickup_path("/token/source"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(app.clickup.requests().is_empty());
+}
+
+#[tokio::test]
+async fn clickup_key_is_checked_stored_encrypted_and_never_shown() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("No key saved yet."));
+
+    let cases = [
+        ("garbage", "token_invalid"),
+        ("pk_1_WRONG_KEY_VALUE", "token_rejected"),
+    ];
+    for (token, code) in cases {
+        let form = [("_csrf", csrf.as_str()), ("token", token)];
+        let res = app
+            .post(&clickup_path("/token"), Some(&cookie), &form)
+            .await;
+        assert_eq!(
+            res.redirect(),
+            clickup_path(&format!("?msg={code}")),
+            "{token}"
+        );
+    }
+    app.clickup.fail_with(Some(503));
+    let form = [("_csrf", csrf.as_str()), ("token", mock::TOKEN)];
+    let res = app
+        .post(&clickup_path("/token"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=clickup_unreachable"));
+    app.clickup.fail_with(None);
+    assert!(
+        tokens::info(db, GUILD_ID, "clickup")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    save_clickup_key(&app, &cookie, &csrf).await;
+    let sealed: Vec<u8> = sqlx::query_scalar("SELECT sealed FROM clickup_tokens")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert!(
+        !sealed
+            .windows(mock::TOKEN.len())
+            .any(|w| w == mock::TOKEN.as_bytes())
+    );
+
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(res.body.contains("Test Owner"));
+    assert!(res.body.contains(&mock::TOKEN[mock::TOKEN.len() - 4..]));
+    assert!(!res.body.contains(mock::TOKEN));
+    assert!(res.body.contains("Scorpio Team"), "workspaces are listed");
+
+    let form = [("_csrf", csrf.as_str())];
+    let res = app.post(&clickup_path("/test"), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), clickup_path("?msg=token_ok"));
+
+    let res = app
+        .post(&clickup_path("/token/delete"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=token_removed"));
+    assert!(
+        tokens::info(db, GUILD_ID, "clickup")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let res = app.post(&clickup_path("/test"), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), clickup_path("?msg=token_missing"));
+
+    let requests = app.clickup.requests();
+    assert!(requests.iter().all(|r| r.method == "GET"));
+}
+
+#[tokio::test]
+async fn clickup_workspace_and_mappings() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+
+    let form = [("_csrf", csrf.as_str()), ("team_id", mock::TEAM_ID)];
+    let res = app
+        .post(&clickup_path("/workspace"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=token_missing"));
+
+    save_clickup_key(&app, &cookie, &csrf).await;
+    let form = [("_csrf", csrf.as_str()), ("team_id", "999")];
+    let res = app
+        .post(&clickup_path("/workspace"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=workspace_invalid"));
+    let form = [("_csrf", csrf.as_str()), ("team_id", mock::TEAM_ID)];
+    let res = app
+        .post(&clickup_path("/workspace"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=workspace_saved"));
+
+    // The fixture member "Anna Nowak" is matched automatically.
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(res.body.contains("Igor Zawórski"));
+    assert!(
+        res.body.contains("Anna Nowak (auto, same name)"),
+        "{}",
+        res.body
+    );
+
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("name_2", "Igor Zawórski"),
+        ("map_2", "-"),
+        ("name_3", "Anna Nowak"),
+        ("map_3", "@anna.nowak"),
+        ("map_1", ""),
+    ];
+    let res = app
+        .post(&clickup_path("/mapping"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=mapping_saved"));
+    let map = explicit_mappings(db, GUILD_ID).await.unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(map[&2], Explicit::Never);
+    assert_eq!(map[&3], Explicit::Member(MEMBER_ID));
+
+    // One unknown member: nothing changes.
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("map_3", ""),
+        ("map_1", "nobody-here"),
+    ];
+    let res = app
+        .post(&clickup_path("/mapping"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=mapping_unknown"));
+    assert_eq!(explicit_mappings(db, GUILD_ID).await.unwrap(), map);
+
+    let form = [("_csrf", csrf.as_str()), ("map_abc", "-")];
+    let res = app
+        .post(&clickup_path("/mapping"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(res.body.contains("Never mapped"));
+    assert!(res.body.contains(r#"value="anna.nowak""#));
+
+    // Reloading members falls back to the gateway cache when HTTP fails.
+    let form = [("_csrf", csrf.as_str())];
+    let res = app
+        .post(&clickup_path("/members/refresh"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=members_refreshed"));
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("Reload server members (1)"));
+
+    let summary = app.get(&format!("/guilds/{GUILD_ID}"), Some(&cookie)).await;
+    assert!(summary.body.contains("Scorpio Team"));
+}
+
+#[tokio::test]
+async fn every_account_can_configure_clickup() {
+    let app = TestApp::with_guild().await;
+    let root = app.login_root().await;
+    app.create_user(&root, "alice", USER_PW).await;
+    let alice = app.login("alice", USER_PW).await;
+    let csrf = app.csrf(&alice).await;
+    save_clickup_key(&app, &alice, &csrf).await;
+    let info = tokens::info(&app.state.db, GUILD_ID, "clickup")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.updated_by.as_deref(), Some("alice"));
+}
+
+fn calendar_path(suffix: &str) -> String {
+    format!("/guilds/{GUILD_ID}/modules/calendar{suffix}")
+}
+
+/// Enables the ClickUp module and saves the mock's key as the shared key.
+async fn shared_clickup_key(app: &TestApp, cookie: &str, csrf: &str) {
+    save_clickup_key(app, cookie, csrf).await;
+    let form = [("_csrf", csrf), ("enabled", "1")];
+    app.post(&clickup_path("/toggle"), Some(cookie), &form)
+        .await;
+}
+
+/// Saves the calendar source with the mock's list.
+async fn select_list(app: &TestApp, cookie: &str, csrf: &str) {
+    let form = [
+        ("_csrf", csrf),
+        ("list_select", mock::LIST_ID),
+        ("list_manual", ""),
+        ("time_field", "due"),
+        ("timezone", "Europe/Warsaw"),
+        ("tag_filter", ""),
+    ];
+    let res = app.post(&calendar_path(""), Some(cookie), &form).await;
+    assert_eq!(res.redirect(), calendar_path("?msg=saved"));
+}
+
+fn digest_form(csrf: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("_csrf", csrf.to_owned()),
+        ("kind", "digest".into()),
+        ("name", "Morning agenda".into()),
+        ("enabled", "on".into()),
+        ("channel_id", CHANNEL_ID.to_string()),
+        ("day", "0".into()),
+        ("day", "4".into()),
+        ("time", "08:30".into()),
+        ("lookahead_hours", "24".into()),
+        ("layout", "combined".into()),
+        ("max_events", "10".into()),
+        ("header_template", "**Today** ({count})".into()),
+        ("empty_template", "Nothing today.".into()),
+        ("item_template", "{when} {link}\n{assignees}".into()),
+        ("embed_color", "#7f8cff".into()),
+        ("description_max", "200".into()),
+        ("reactions", format!("✅ <:party:{EMOJI_ID}>")),
+    ]
+}
+
+fn with_field(
+    form: &[(&'static str, String)],
+    key: &'static str,
+    value: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<_> = form.iter().filter(|(k, _)| *k != key).cloned().collect();
+    if let Some(v) = value {
+        out.push((key, v.to_owned()));
+    }
+    out
+}
+
+async fn post_owned(
+    app: &TestApp,
+    path: &str,
+    cookie: &str,
+    form: &[(&'static str, String)],
+) -> TestResponse {
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    app.post(path, Some(cookie), &pairs).await
+}
+
+#[tokio::test]
+async fn calendar_routes_require_login_and_csrf() {
+    let app = TestApp::with_guild().await;
+    for path in [calendar_path(""), calendar_path("/rules/new?kind=digest")] {
+        assert_eq!(app.get(&path, None).await.redirect(), "/login", "{path}");
+    }
+    let cookie = app.login_root().await;
+    for suffix in [
+        "",
+        "/refresh",
+        "/rules",
+        "/rules/1",
+        "/rules/1/delete",
+        "/rules/1/test",
+        "/token",
+        "/token/delete",
+        "/token/source",
+    ] {
+        let path = calendar_path(suffix);
+        assert_eq!(
+            app.post(&path, None, &[]).await.redirect(),
+            "/login",
+            "{path}"
+        );
+        let res = app.post(&path, Some(&cookie), &[("name", "x")]).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn calendar_source_uses_shared_or_own_key() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+
+    // Shared key by default, but the ClickUp module is off.
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("list_select", mock::LIST_ID),
+        ("time_field", "due"),
+        ("timezone", "UTC"),
+    ];
+    let res = app.post(&calendar_path(""), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), calendar_path("?msg=clickup_disabled"));
+
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    select_list(&app, &cookie, &csrf).await;
+    let cfg = calendar::load_config(db, GUILD_ID).await.unwrap();
+    assert_eq!(cfg.list_id.as_deref(), Some(mock::LIST_ID));
+    assert_eq!(cfg.list_name.as_deref(), Some("Events / Team / Calendar"));
+    assert_eq!(cfg.timezone, "Europe/Warsaw");
+
+    let cases = [
+        ("list_manual", "999", "list_not_found"),
+        ("list_manual", "../x", "list_not_found"),
+        ("timezone", "Mars/Base", "timezone_invalid"),
+        ("tag_filter", "a,b,c,d,e,f", "tags_invalid"),
+    ];
+    for (field, value, code) in cases {
+        let mut form = vec![
+            ("_csrf", csrf.as_str()),
+            ("time_field", "due"),
+            ("timezone", "UTC"),
+        ];
+        form.retain(|(k, _)| *k != field);
+        form.push((field, value));
+        let res = app.post(&calendar_path(""), Some(&cookie), &form).await;
+        assert_eq!(
+            res.redirect(),
+            calendar_path(&format!("?msg={code}")),
+            "{field}"
+        );
+    }
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("list_select", mock::LIST_ID),
+        ("time_field", "sideways"),
+        ("timezone", "UTC"),
+    ];
+    let res = app.post(&calendar_path(""), Some(&cookie), &form).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // A list URL works too.
+    let url = format!("https://app.clickup.com/100/v/li/{}", mock::OTHER_LIST_ID);
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("list_manual", url.as_str()),
+        ("time_field", "start"),
+        ("timezone", "UTC"),
+        ("tag_filter", " meeting ,event"),
+        ("include_subtasks", "on"),
+    ];
+    let res = app.post(&calendar_path(""), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), calendar_path("?msg=saved"));
+    let cfg = calendar::load_config(db, GUILD_ID).await.unwrap();
+    assert_eq!(cfg.list_id.as_deref(), Some(mock::OTHER_LIST_ID));
+    assert_eq!(cfg.list_name.as_deref(), Some("Events / Misc"));
+    assert_eq!(cfg.tag_filter, "meeting, event");
+    assert!(cfg.start_mode() && cfg.include_subtasks && !cfg.include_closed);
+
+    // Switching to its own key: none saved yet, so ClickUp is not used.
+    let form = [("_csrf", csrf.as_str()), ("source", "own")];
+    let res = app
+        .post(&calendar_path("/token/source"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), calendar_path("?msg=source_saved"));
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("list_select", mock::LIST_ID),
+        ("time_field", "due"),
+        ("timezone", "UTC"),
+    ];
+    let res = app.post(&calendar_path(""), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), calendar_path("?msg=token_missing"));
+
+    let form = [("_csrf", csrf.as_str()), ("source", "sideways")];
+    let res = app
+        .post(&calendar_path("/token/source"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    let form = [("_csrf", csrf.as_str()), ("token", mock::TOKEN)];
+    let res = app
+        .post(&calendar_path("/token"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), calendar_path("?msg=token_saved"));
+    assert!(!tokens::use_shared(db, GUILD_ID, "calendar").await.unwrap());
+    select_list(&app, &cookie, &csrf).await;
+
+    let page = app.get(&calendar_path(""), Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.body.contains(mock::TOKEN));
+    assert!(
+        page.body.contains(r#"<optgroup label="Events / Team">"#),
+        "list picker"
+    );
+    assert!(app.clickup.requests().iter().all(|r| r.method == "GET"));
+}
+
+#[tokio::test]
+async fn calendar_page_lists_upcoming_events_and_rules() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    select_list(&app, &cookie, &csrf).await;
+
+    let soon = (crate::db::now() + 3600) * 1000;
+    let mut task = mock::task("t1", "Sprint <review>", Some(soon));
+    task["assignees"] = serde_json::json!([
+        {"id": 3, "username": "Anna Nowak", "email": "a@x.io"},
+        {"id": 9, "username": "Guest", "email": "g@x.io"}
+    ]);
+    app.clickup.set_tasks(mock::LIST_ID, vec![task]);
+    let form = [("_csrf", csrf.as_str())];
+    let res = app
+        .post(&calendar_path("/refresh"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), calendar_path("?msg=refreshed"));
+
+    let mut rule = Rule::new(Kind::Reminder);
+    rule.channel_id = Some(VOICE_CHANNEL_ID);
+    calendar::insert_rule(&app.state.db, GUILD_ID, &rule, "root")
+        .await
+        .unwrap();
+
+    let page = app.get(&calendar_path(""), Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains("Sprint &#60;review&#62;"),
+        "escaped title"
+    );
+    assert!(page.body.contains("@Anna Nowak"));
+    assert!(page.body.contains("Guest (no member)"));
+    assert!(page.body.contains("15 minutes before each event"));
+    assert!(
+        page.body.contains("The channel of rule"),
+        "voice channel is not a text channel"
+    );
+}
+
+#[tokio::test]
+async fn calendar_rule_create_validate_edit_delete() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+
+    let res = app
+        .get(&calendar_path("/rules/new?kind=digest"), Some(&cookie))
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("Daily agenda"));
+    assert!(
+        res.body.contains(&format!("&#60;:party:{EMOJI_ID}&#62;")),
+        "emoji chips"
+    );
+    let res = app
+        .get(&calendar_path("/rules/new?kind=weekly"), Some(&cookie))
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    let base = digest_form(&csrf);
+    let long = "x".repeat(1501);
+    let voice = VOICE_CHANNEL_ID.to_string();
+    let cases: Vec<(&str, Option<&str>, &str)> = vec![
+        ("name", Some(" "), "rule_name"),
+        ("channel_id", Some(voice.as_str()), "invalid_channel"),
+        ("channel_id", Some("abc"), "invalid_channel"),
+        ("day", None, "rule_no_days"),
+        ("time", Some("25:00"), "rule_time"),
+        ("lookahead_hours", Some("0"), "rule_lookahead"),
+        ("max_events", Some("51"), "rule_max_events"),
+        ("item_template", Some("  "), "template_empty"),
+        ("header_template", Some(long.as_str()), "template_long"),
+        ("embed_color", Some("red"), "invalid_color"),
+        ("description_max", Some("5000"), "rule_description_max"),
+        ("reactions", Some("nope"), "reactions_invalid"),
+        ("reactions", Some("<:other:5>"), "reactions_invalid"),
+    ];
+    for (field, value, code) in cases {
+        let form = with_field(&base, field, value);
+        let res = post_owned(&app, &calendar_path("/rules"), &cookie, &form).await;
+        assert_eq!(
+            res.redirect(),
+            calendar_path(&format!("/rules/new?kind=digest&msg={code}")),
+            "{field}"
+        );
+    }
+    assert_eq!(calendar::count_rules(db, GUILD_ID).await.unwrap(), 0);
+    let flash = app
+        .get(
+            &calendar_path("/rules/new?kind=digest&msg=rule_time"),
+            Some(&cookie),
+        )
+        .await;
+    assert!(flash.body.contains("The time must look like 09:00."));
+
+    let res = post_owned(&app, &calendar_path("/rules"), &cookie, &base).await;
+    let location = res.redirect().to_owned();
+    assert!(location.ends_with("?msg=rule_created"), "{location}");
+    let rules = calendar::list_rules(db, GUILD_ID).await.unwrap();
+    let rule = &rules[0];
+    assert_eq!(rule.name, "Morning agenda");
+    assert_eq!(rule.days, 0b1_0001);
+    assert_eq!(rule.time_of_day, 8 * 60 + 30);
+    assert_eq!(rule.channel_id, Some(CHANNEL_ID));
+    assert_eq!(rule.reactions.len(), 2);
+    assert!(rule.enabled && !rule.mention_assignees);
+    assert_eq!(
+        location,
+        calendar_path(&format!("/rules/{}?msg=rule_created", rule.id))
+    );
+
+    let page = app
+        .get(
+            &calendar_path(&format!("/rules/{}", rule.id)),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains("Weekly sync"),
+        "preview with a sample event"
+    );
+
+    // Edit: the kind cannot change, fields of the other kind are ignored.
+    let edit = with_field(&base, "name", Some("Renamed"));
+    let edit = with_field(&edit, "kind", Some("reminder"));
+    let edit = with_field(&edit, "mention_assignees", Some("on"));
+    let path = calendar_path(&format!("/rules/{}", rule.id));
+    let res = post_owned(&app, &path, &cookie, &edit).await;
+    assert_eq!(res.redirect(), format!("{path}?msg=saved"));
+    let saved = calendar::load_rule(db, GUILD_ID, rule.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.name, "Renamed");
+    assert_eq!(saved.kind, Kind::Digest);
+    assert!(saved.mention_assignees);
+    let bad = with_field(&base, "time", Some("noon"));
+    let res = post_owned(&app, &path, &cookie, &bad).await;
+    assert_eq!(res.redirect(), format!("{path}?msg=rule_time"));
+
+    // A reminder only needs its own fields.
+    let reminder = vec![
+        ("_csrf", csrf.clone()),
+        ("kind", "reminder".to_owned()),
+        ("name", "Heads up".to_owned()),
+        ("channel_id", CHANNEL_ID.to_string()),
+        ("lead_minutes", "30".to_owned()),
+        ("item_template", "{link} {relative}".to_owned()),
+        ("embed_color", "#000000".to_owned()),
+        ("description_max", "0".to_owned()),
+    ];
+    let res = post_owned(&app, &calendar_path("/rules"), &cookie, &reminder).await;
+    assert!(res.redirect().ends_with("?msg=rule_created"));
+    let bad = with_field(&reminder, "lead_minutes", Some("0"));
+    let res = post_owned(&app, &calendar_path("/rules"), &cookie, &bad).await;
+    assert_eq!(
+        res.redirect(),
+        calendar_path("/rules/new?kind=reminder&msg=rule_lead")
+    );
+
+    let form = [("_csrf", csrf.as_str())];
+    let res = app
+        .post(&format!("{path}/delete"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), calendar_path("?msg=rule_deleted"));
+    assert_eq!(calendar::count_rules(db, GUILD_ID).await.unwrap(), 1);
+    let res = app
+        .post(&format!("{path}/delete"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn calendar_rules_of_other_guilds_are_not_reachable() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+    let foreign = calendar::insert_rule(db, 42, &Rule::new(Kind::Digest), "x")
+        .await
+        .unwrap();
+
+    let path = calendar_path(&format!("/rules/{foreign}"));
+    assert_eq!(
+        app.get(&path, Some(&cookie)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let form = digest_form(&csrf);
+    for target in [
+        path.clone(),
+        format!("{path}/delete"),
+        format!("{path}/test"),
+    ] {
+        let res = post_owned(&app, &target, &cookie, &form).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{target}");
+    }
+    assert_eq!(calendar::count_rules(db, 42).await.unwrap(), 1);
+    let res = app.get(&calendar_path("/rules/abc"), Some(&cookie)).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn calendar_rule_limit() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    for _ in 0..calendar::MAX_RULES {
+        calendar::insert_rule(&app.state.db, GUILD_ID, &Rule::new(Kind::Digest), "root")
+            .await
+            .unwrap();
+    }
+    let res = post_owned(&app, &calendar_path("/rules"), &cookie, &digest_form(&csrf)).await;
+    assert_eq!(res.redirect(), calendar_path("?msg=too_many_rules"));
+    let page = app.get(&calendar_path(""), Some(&cookie)).await;
+    assert!(!page.body.contains("New digest"));
+}
+
+#[tokio::test]
+async fn calendar_test_message_reports_failures() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+    let form = [("_csrf", csrf.as_str())];
+
+    let mut rule = Rule::new(Kind::Reminder);
+    let no_channel = calendar::insert_rule(db, GUILD_ID, &rule, "root")
+        .await
+        .unwrap();
+    rule.channel_id = Some(CHANNEL_ID);
+    let rid = calendar::insert_rule(db, GUILD_ID, &rule, "root")
+        .await
+        .unwrap();
+    let test_path = |id: i64| calendar_path(&format!("/rules/{id}/test"));
+
+    let res = app.post(&test_path(no_channel), Some(&cookie), &form).await;
+    assert!(res.redirect().ends_with("?msg=no_channel"));
+    let res = app.post(&test_path(rid), Some(&cookie), &form).await;
+    assert!(
+        res.redirect().ends_with("?msg=calendar_no_list"),
+        "{}",
+        res.location()
+    );
+
+    // With a list, the post reaches the (closed) Discord port and fails.
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    select_list(&app, &cookie, &csrf).await;
+    let res = app.post(&test_path(rid), Some(&cookie), &form).await;
+    assert!(
+        res.redirect().ends_with("?msg=test_failed"),
+        "{}",
+        res.location()
+    );
+    let log = calendar::recent_log(db, GUILD_ID, 1).await.unwrap();
+    assert!(log[0].is_test && !log[0].success);
+    assert_eq!(
+        crate::modules::counter(db, Some(GUILD_ID), "calendar", "failed")
+            .await
+            .unwrap(),
+        0,
+        "tests are not counted"
+    );
 }

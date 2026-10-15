@@ -181,6 +181,67 @@ impl Flash {
             "template_empty" => (false, "The message cannot be empty."),
             "template_long" => (false, "The message is too long."),
             "invalid_color" => (false, "Embed color must look like #7f8cff."),
+            "token_saved" => (true, "API key checked with ClickUp and saved."),
+            "token_removed" => (true, "API key removed."),
+            "token_invalid" => (
+                false,
+                "That does not look like a ClickUp personal API key, which starts with pk_.",
+            ),
+            "token_rejected" => (false, "ClickUp rejected this API key. Nothing was saved."),
+            "clickup_unreachable" => (
+                false,
+                "Could not reach ClickUp. Nothing was changed, try again in a moment.",
+            ),
+            "token_ok" => (true, "ClickUp accepted the saved API key."),
+            "token_check_failed" => (
+                false,
+                "ClickUp did not accept the saved API key. See the error on the key card.",
+            ),
+            "token_missing" => (false, "Save a ClickUp API key first."),
+            "token_unreadable" => (
+                false,
+                "The saved API key cannot be decrypted. Save the key again.",
+            ),
+            "source_saved" => (true, "API key choice saved."),
+            "workspace_saved" => (true, "Workspace saved."),
+            "workspace_invalid" => (false, "Pick a workspace this API key can access."),
+            "mapping_saved" => (true, "Mappings saved."),
+            "mapping_unknown" => (
+                false,
+                "A Discord member was not found or the name is not unique. Use a username or \
+                 user ID. Nothing was saved.",
+            ),
+            "members_refreshed" => (true, "Server members reloaded."),
+            "clickup_disabled" => (
+                false,
+                "This module uses the shared ClickUp key, but the ClickUp module is disabled. \
+                 Enable it or save a separate key.",
+            ),
+            "list_not_found" => (
+                false,
+                "That ClickUp list was not found, or the API key cannot see it.",
+            ),
+            "timezone_invalid" => (false, "Unknown time zone. Use a name like Europe/Warsaw."),
+            "tags_invalid" => (false, "Use at most 5 tags of up to 50 characters each."),
+            "calendar_no_list" => (false, "Select a ClickUp list first."),
+            "refreshed" => (true, "Reloaded from ClickUp."),
+            "rule_created" => (true, "Rule created."),
+            "rule_deleted" => (true, "Rule deleted."),
+            "too_many_rules" => (false, "This server has the maximum number of rules."),
+            "rule_name" => (false, "The rule name must be 1 to 60 characters."),
+            "rule_no_days" => (false, "Pick at least one day."),
+            "rule_time" => (false, "The time must look like 09:00."),
+            "rule_lookahead" => (false, "Look ahead between 1 and 336 hours."),
+            "rule_lead" => (
+                false,
+                "Remind between 1 minute and 7 days (10080 minutes) before.",
+            ),
+            "rule_max_events" => (false, "Show between 1 and 50 events."),
+            "rule_description_max" => (false, "The description length must be 0 to 1000."),
+            "reactions_invalid" => (
+                false,
+                "Reactions must be up to 5 emojis, custom ones from this server only.",
+            ),
             "pw_changed" => (
                 true,
                 "Password changed. Your other sessions were signed out.",

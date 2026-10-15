@@ -134,6 +134,7 @@ code { font-family: var(--mono); font-size: 0.88em; background: var(--raised); b
 .badge-on { background: var(--ok-soft); color: var(--ok); border-color: rgba(79, 178, 134, 0.3); }
 .badge-off, .badge-muted { background: var(--raised); color: var(--muted); border-color: var(--border); }
 .badge-err { background: var(--err-soft); color: var(--err); border-color: rgba(208, 96, 94, 0.3); cursor: help; }
+.badge-warn { background: var(--warn-soft); color: #e2c48f; border-color: rgba(210, 162, 76, 0.3); white-space: normal; }
 .badge-accent { background: var(--accent-soft); color: var(--accent); border-color: rgba(127, 140, 255, 0.3); margin-left: 0.35rem; }
 
 /* Buttons */
@@ -163,7 +164,7 @@ code { font-family: var(--mono); font-size: 0.88em; background: var(--raised); b
 .form label { display: flex; flex-direction: column; gap: 0.35rem; }
 .form label > span:first-child { font-size: 0.85rem; font-weight: 500; color: var(--text); }
 .label-row { display: flex; justify-content: space-between; align-items: baseline; }
-input[type="text"], input[type="password"], select, textarea {
+input[type="text"], input[type="password"], input[type="number"], input[type="time"], select, textarea {
   width: 100%; padding: 0.55rem 0.7rem;
   background: var(--input); color: var(--text-strong);
   border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -175,11 +176,28 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 input::placeholder, textarea::placeholder { color: #5d6575; }
 .form label.check { flex-direction: row; align-items: center; gap: 0.6rem; cursor: pointer; }
 .form label.check > span:first-child { font-weight: 400; }
-input[type="checkbox"] { width: 1.05rem; height: 1.05rem; accent-color: var(--accent); margin: 0; }
+input[type="checkbox"], input[type="radio"] { width: 1.05rem; height: 1.05rem; accent-color: var(--accent); margin: 0; flex: none; }
 .form label.inline-field { flex-direction: row; align-items: center; justify-content: space-between; }
 input[type="color"] { width: 3rem; height: 2rem; padding: 2px; background: var(--input); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
 
 .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: -0.4rem; }
+
+/* ClickUp */
+.key-status { margin-bottom: 1rem; }
+.key-status dd { white-space: normal; }
+.mapping-table td:first-child { white-space: normal; }
+.mapping-table .badge-on { white-space: normal; }
+.mapping-table input[type="text"] { min-width: 12rem; }
+.stack > .stats-grid { margin: 0; }
+
+/* Calendar */
+.field-group { border: 0; padding: 0; margin: 0; }
+.field-group legend { font-size: 0.85rem; font-weight: 500; color: var(--text); padding: 0; margin-bottom: 0.35rem; }
+.day-row { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; }
+.form label.inline-field input[type="number"], .form label.inline-field input[type="time"] { width: 7.5rem; flex: none; }
+.emoji-chip { font-family: inherit; font-size: 1rem; line-height: 1; display: inline-flex; align-items: center; }
+.emoji-chip img { display: block; }
+.preview { white-space: pre-wrap; word-break: break-word; background: var(--raised); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.75rem 0.9rem; margin: 0 0 0.75rem; font: 0.9rem/1.45 var(--font); color: var(--text-strong); max-height: 26rem; overflow: auto; }
 .chip { font: 0.8rem var(--mono); padding: 0.25rem 0.55rem; border-radius: 999px; background: var(--raised); color: var(--muted); border: 1px solid var(--border); cursor: pointer; }
 .chip:hover { color: var(--text-strong); border-color: var(--accent); }
 

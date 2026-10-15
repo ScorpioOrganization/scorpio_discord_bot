@@ -29,7 +29,7 @@ cargo test locks_ip_after_limit    # single test by name (substring match)
 cargo test auth::                  # all tests in a module path
 cargo clippy --all-targets -- -D warnings
 cargo fmt
-cargo deny check                   # advisories, licenses, bans, sources (deny.toml)
+cargo deny check                   # advisories, licenses, bans, sources (deny.toml); not installed on the host, see README for the Docker one-liner
 mkdir -p data                      # bind mounted at /data, must exist before compose up
 docker compose up -d --build       # dashboard published on 127.0.0.1:8080
 docker compose logs bot            # first start prints the generated root password
@@ -41,7 +41,9 @@ Config is read from env / `.env` (see `.env.example`, `src/config.rs`). A new en
 
 ## Architecture
 
-One binary, one tokio runtime. `main.rs` builds an `AppState` (`src/state.rs`) and shares it between the serenity bot client and the axum dashboard (`src/web`). An hourly `maintenance` task in `main.rs` prunes sessions, module logs and the login limiter.
+One binary, one tokio runtime. `main.rs` builds an `AppState` (`src/state.rs`) and shares it between the serenity bot client and the axum dashboard (`src/web`). An hourly `maintenance` task in `main.rs` prunes sessions, module logs, the login limiter, the member cache and the TTL cache. When a Discord client exists, `bot::scheduler::run` calls `Module::on_tick` once a minute (see Modules).
+
+`AppState` also carries `vault` (`secrets::Vault`, encrypts stored API keys), `clickup` (the shared `ClickUpClient`, pointed at a mock in tests), `members` (`bot::members::MemberCache`, guild member lists for name matching, 10 min) and `cache` (`cache::TtlCache`, typed key/value cache for data fetched from other services; readers pass a max age).
 
 The bot is optional and must never take the dashboard down. Token rejection, disallowed intents or a client crash are stored with `AppState::set_bot_error` and shown on the dashboard instead of exiting. `AppState::discord()` is `None` when no client exists, so web code must handle that.
 
@@ -63,14 +65,29 @@ Every bot feature is a `Module` (`src/modules/mod.rs`) registered in `modules::r
 - `Module::summary()` feeds the module card on the guild page; the guild page lists every registered module automatically.
 - `Module::intents()` is unioned into the gateway intents (`bot::wanted_intents`). Privileged intents switched off in the developer portal are dropped at connect time so the bot still comes online; the dashboard warns using `AppState::missing_intents` + `bot::privileged_names`.
 - Event dispatch is explicit: `Handler` in `src/bot/mod.rs` currently only routes `guild_member_addition` to `Module::on_member_join`, checking `is_enabled` per module. A new event type needs a default method on the trait plus a matching dispatch loop in `Handler`.
-- Log pruning is not part of the trait: `maintenance` in `main.rs` calls `greeting::prune_log` directly, so a new module with a log table needs its own call there.
-- Messages sent to Discord must restrict pings with `CreateAllowedMentions` (see `greeting::send`) so templates or user names cannot ping `@everyone` or roles.
+- Periodic work: a module returns `true` from `ticks()` and implements `on_tick(state, discord, guild_id)`. `bot::scheduler` runs it about once a minute for every guild the module is enabled in and the bot is in, concurrently with a 50 s timeout; errors are logged. Keep ticks cheap when there is nothing to do (no remote calls). `calendar` is the reference (`runner::run` takes a `now` and an `Outbox` so it is testable).
+- Log pruning is not part of the trait: `maintenance` in `main.rs` calls `greeting::prune_log` and `calendar::prune` directly, so a new module with a log table needs its own call there.
+- Messages sent to Discord must restrict pings with `CreateAllowedMentions` (see `greeting::send`, `calendar::runner::DiscordOutbox`) so templates or user names cannot ping `@everyone` or roles.
+- User configurable templates use `modules::text` (`render` with a closure, `escape_markdown`, `truncate_chars`, `parse_hex_color`).
+
+### ClickUp integration
+
+Shared layer in `src/clickup`, used by the `clickup` module (the shared key, workspace and people mapping) and by `calendar`. Future ClickUp modules must reuse it:
+
+- `client.rs`: the only way to talk to ClickUp. It implements GET requests only, which keeps every module read-only; do not add write methods. Errors never contain the key. `mock.rs` (tests) is an in-process fake API that filters and pages tasks like ClickUp and records requests.
+- `tokens.rs`: per guild keys in `clickup_tokens`, sealed by `secrets::Vault` with the row (`clickup:{guild}:{owner}`) as authenticated data. `owner` is `clickup` (shared key) or a module id (own key); `clickup_token_source` says which one a module uses (shared by default, and only while the ClickUp module is enabled). Use `resolve(state, guild, module_id)` to get a key and wrap every API call in `track(..)`, which records last success / error and `api_ok` / `api_err` counters. Keys are write-only: never render, log or return them.
+- `web.rs`: `token_routes(owner)` + `token_view` + `templates/clickup/token_card.html` give a module the key card (save after a `GET /user` check, remove, shared or own).
+- `mapping.rs`: pure name matching (`Resolver`); `modules::clickup::resolver(state, guild, people)` combines it with the explicit mappings and the guild member list.
+- `secrets.rs`: the key comes from `SECRETS_KEY` or a generated `secret.key` next to the database (ephemeral for `:memory:`). Losing it only means keys must be re-entered.
 
 ### Tests
 
 - Unit tests live next to the code in `#[cfg(test)] mod tests`. DB tests use `test_util::pool()` (in-memory SQLite, migrated, single connection because every `:memory:` connection is its own database).
 - Dashboard tests (`src/web/tests.rs`) use `test_util::TestApp`: the real `web::router` with a root account, driven with `tower::ServiceExt::oneshot` (no socket, no Discord, so `require_guild` 404s). Helpers: `login`, `login_from(ip, ..)`, `csrf`, `create_user`, `post`/`get` with a cookie, `TestResponse::redirect()`.
 - New routes need tests for: login required, CSRF rejected, root only where applicable, and the happy path redirect code.
+- `TestApp::with_guild()` (or `test_util::connect_fake_discord(&state)`) fakes a connected bot in guild `test_util::GUILD_ID` with text channels, a voice channel, a custom emoji and one member, so guild routes get happy path tests. Its Discord HTTP client points at a closed local port: anything that really calls Discord fails fast (useful for "send test" error paths), never reaching discord.com. Every `TestApp` also runs a `MockClickUp` (`app.clickup`) that the app's `ClickUpClient` talks to; key `mock::TOKEN`, list `mock::LIST_ID`.
+- Calendar runner tests use `runner::tests::RecordingOutbox` and fixed timestamps instead of Discord and the clock.
+- Askama escapes `<` and `>` as `&#60;` and `&#62;`, check rendered HTML for those.
 - Argon2 is built with `opt-level = 3` in the dev profile (`Cargo.toml`), otherwise login heavy tests take seconds.
 
 ### Web dashboard and security conventions
@@ -80,5 +97,5 @@ Every bot feature is a `Module` (`src/modules/mod.rs`) registered in `modules::r
 - Handlers return `AppResult<T>`; `AppError::Internal` logs the detail and shows a generic page. Non handler code uses `anyhow`.
 - After a POST, redirect with `web::redirect_msg(path, code)`. The code must be added to `Flash::from_code` in `src/web/mod.rs`; only fixed messages are shown, user input is never reflected.
 - Askama page structs carry `page: PageCtx` and templates extend `templates/base.html`.
-- Strict CSP (`src/web/mod.rs`): no inline scripts, inline styles or `on*` attributes. All JS goes in `static/app.js` as progressive enhancement (pages must work without JS), all CSS in `static/app.css`. External images only from `cdn.discordapp.com`.
+- Strict CSP (`src/web/mod.rs`): no inline scripts, inline styles or `on*` attributes. All JS goes in `static/app.js` as progressive enhancement (pages must work without JS), all CSS in `static/app.css`. External images only from `cdn.discordapp.com`. Placeholder / emoji buttons use `data-insert` with `data-target` (input id) and optional `data-append`.
 - Passwords use Argon2id on a blocking thread; session tokens are stored only as SHA-256; login is throttled per IP and per username (`auth/limiter.rs`, in memory).

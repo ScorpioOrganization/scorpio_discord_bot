@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}ClickUp | {{ guild.name }}{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <span>ClickUp</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>ClickUp</h1>
+    <p class="muted">The API key other modules can share, and who is who between ClickUp and this server.</p>
+  </div>
+  <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/toggle" class="toggle-form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <input type="hidden" name="back" value="module">
+    {% if enabled %}
+    <span class="badge badge-on">Enabled</span>
+    <input type="hidden" name="enabled" value="0">
+    <button class="btn btn-ghost" type="submit">Disable</button>
+    {% else %}
+    <span class="badge badge-off">Disabled</span>
+    <input type="hidden" name="enabled" value="1">
+    <button class="btn btn-primary" type="submit">Enable</button>
+    {% endif %}
+  </form>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <div class="stack">
+    {% include "clickup/token_card.html" %}
+    {% if has_key %}
+    <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/test" class="actions">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-secondary" type="submit">Test connection</button>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="stack">
+    <section class="card">
+      <h2>Workspace</h2>
+      {% if !has_key %}
+      <p class="muted">Save an API key first.</p>
+      {% else if let Some(err) = team_error %}
+      <div class="callout callout-err small">Could not load workspaces: {{ err }}</div>
+      {% else %}
+      <form class="form" method="post" action="/guilds/{{ guild.id }}/modules/clickup/workspace">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <label>
+          <span>Workspace whose people are listed below</span>
+          <select name="team_id">
+            <option value="">None</option>
+            {% for t in teams %}
+            <option value="{{ t.id }}"{% if t.selected %} selected{% endif %}>{{ t.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="actions"><button class="btn btn-secondary" type="submit">Save workspace</button></div>
+      </form>
+      {% endif %}
+    </section>
+
+    <section class="stats-grid">
+      <div class="stat"><span class="stat-label">ClickUp requests</span><span class="stat-value">{{ api_ok }}</span></div>
+      <div class="stat"><span class="stat-label">Failed requests</span><span class="stat-value{% if api_err > 0 %} text-err{% endif %}">{{ api_err }}</span></div>
+    </section>
+  </div>
+</div>
+
+<section class="card">
+  <div class="label-row">
+    <h2>People</h2>
+    <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/members/refresh">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-ghost btn-sm" type="submit">Reload server members ({{ member_count }})</button>
+    </form>
+  </div>
+  <p class="hint">People are matched to server members by name automatically: accents, dots and word order are ignored and small typos are tolerated. Type a username, display name or user ID to pin a person to a member, <code>-</code> to never mention them, or leave the field empty for automatic matching.</p>
+  {% if people.is_empty() %}
+  <p class="muted">{% if workspace.is_some() %}This workspace has no people.{% else %}Select a workspace to list its people.{% endif %}</p>
+  {% else %}
+  <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/mapping">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <div class="table-wrap">
+      <table class="table mapping-table">
+        <thead><tr><th>ClickUp</th><th>Discord member</th><th>Pin to</th></tr></thead>
+        <tbody>
+        {% for p in people %}
+        <tr>
+          <td>{{ p.name }}{% if !p.email.is_empty() %}<br><span class="muted small">{{ p.email }}</span>{% endif %}</td>
+          <td><span class="badge {{ p.badge }}">{{ p.status }}</span></td>
+          <td>
+            <input type="hidden" name="name_{{ p.id }}" value="{{ p.name }}">
+            <input type="text" name="map_{{ p.id }}" value="{{ p.input }}" list="server-members" placeholder="automatic" autocomplete="off" aria-label="Discord member for {{ p.name }}">
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <datalist id="server-members">
+      {% for m in member_options %}
+      <option value="{{ m.value }}">{{ m.label }}</option>
+      {% endfor %}
+    </datalist>
+    <div class="actions"><button class="btn btn-primary" type="submit">Save mappings</button></div>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

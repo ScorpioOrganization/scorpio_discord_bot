@@ -6,8 +6,12 @@ use serenity::all::{Cache, GatewayIntents, Http, ShardManager};
 use sqlx::SqlitePool;
 
 use crate::auth::limiter::LoginLimiter;
+use crate::bot::members::MemberCache;
+use crate::cache::TtlCache;
+use crate::clickup::ClickUpClient;
 use crate::config::Config;
 use crate::modules::Module;
+use crate::secrets::Vault;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,6 +20,13 @@ pub struct AppState {
     pub modules: Arc<Vec<Arc<dyn Module>>>,
     pub stats: Arc<BotStats>,
     pub limiter: Arc<LoginLimiter>,
+    /// Encrypts API keys stored in the database.
+    pub vault: Arc<Vault>,
+    pub clickup: ClickUpClient,
+    /// Recently fetched guild member lists.
+    pub members: Arc<MemberCache>,
+    /// Module data fetched from other services, e.g. ClickUp tasks.
+    pub cache: Arc<TtlCache>,
     /// Set once the serenity client is built. Stays empty when no token is configured.
     pub discord: Arc<OnceLock<DiscordHandle>>,
     /// Why the Discord connection is down, shown on the dashboard. None while healthy.
@@ -32,13 +43,22 @@ pub struct DiscordHandle {
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool, config: Config, modules: Vec<Arc<dyn Module>>) -> Self {
+    pub fn new(
+        db: SqlitePool,
+        config: Config,
+        modules: Vec<Arc<dyn Module>>,
+        vault: Vault,
+    ) -> Self {
         Self {
             db,
             config: Arc::new(config),
             modules: Arc::new(modules),
             stats: Arc::new(BotStats::default()),
             limiter: Arc::new(LoginLimiter::default()),
+            vault: Arc::new(vault),
+            clickup: ClickUpClient::default(),
+            members: Arc::new(MemberCache::default()),
+            cache: Arc::new(TtlCache::default()),
             discord: Arc::new(OnceLock::new()),
             bot_error: Arc::new(Mutex::new(None)),
         }

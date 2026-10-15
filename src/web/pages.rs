@@ -125,6 +125,7 @@ struct OverviewPage {
     member_joins: u64,
     events_handled: u64,
     greetings_total: i64,
+    calendar_total: i64,
     module_count: usize,
     guilds: Vec<GuildRow>,
 }
@@ -158,6 +159,7 @@ pub async fn overview(
         member_joins: stats.member_joins.load(Ordering::Relaxed),
         events_handled: stats.events_handled.load(Ordering::Relaxed),
         greetings_total: modules::counter(&state.db, None, modules::greeting::ID, "sent").await?,
+        calendar_total: modules::calendar::posts_sent(&state.db, None).await?,
         module_count: state.modules.len(),
         guilds: rows,
     };

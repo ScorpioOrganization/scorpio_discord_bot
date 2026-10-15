@@ -1,4 +1,6 @@
 pub mod info;
+pub mod members;
+pub mod scheduler;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

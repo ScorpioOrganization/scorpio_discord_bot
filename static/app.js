@@ -28,6 +28,24 @@
     });
   });
 
+  // Chips insert their text into the field named by data-target (the greeting template by
+  // default): at the cursor, or appended with a space when data-append is set.
+  document.querySelectorAll("[data-insert]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var target = document.getElementById(btn.dataset.target || "tpl");
+      if (!target) return;
+      var token = btn.dataset.insert;
+      if (btn.dataset.append) {
+        var current = target.value.trim();
+        target.value = current ? current + " " + token : token;
+      } else {
+        target.setRangeText(token, target.selectionStart, target.selectionEnd, "end");
+      }
+      target.focus();
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  });
+
   initGreetingEditor();
 
   function initGreetingEditor() {
@@ -97,17 +115,6 @@
         embed.hidden = true;
       }
     }
-
-    document.querySelectorAll("[data-insert]").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        var token = btn.dataset.insert;
-        var start = tpl.selectionStart;
-        var end = tpl.selectionEnd;
-        tpl.setRangeText(token, start, end, "end");
-        tpl.focus();
-        update();
-      });
-    });
 
     [tpl, useEmbed, color].forEach(function (el) {
       if (!el) return;

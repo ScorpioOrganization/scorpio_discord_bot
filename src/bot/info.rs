@@ -29,6 +29,8 @@ pub struct ChannelOption {
     /// False only when we know the bot cannot view or post in the channel.
     pub can_send: bool,
     pub can_embed: bool,
+    /// Adding reactions also needs the message history permission.
+    pub can_react: bool,
     pub selected: bool,
 }
 
@@ -92,6 +94,7 @@ pub fn text_channels(cache: &Cache, guild_id: u64) -> Vec<ChannelOption> {
                     name: c.name.clone(),
                     can_send: has(Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES),
                     can_embed: has(Permissions::EMBED_LINKS),
+                    can_react: has(Permissions::ADD_REACTIONS | Permissions::READ_MESSAGE_HISTORY),
                     selected: false,
                 },
             )

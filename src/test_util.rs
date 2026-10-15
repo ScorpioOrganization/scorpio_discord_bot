@@ -2,22 +2,37 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use serenity::all::{
+    Cache, GatewayIntents, GuildCreateEvent, HttpBuilder, ShardManager, ShardManagerOptions,
+};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tower::ServiceExt;
 
 use crate::auth;
+use crate::bot::members;
+use crate::clickup::mock::MockClickUp;
 use crate::config::Config;
-use crate::modules;
-use crate::state::AppState;
+use crate::modules::{self, Module};
+use crate::secrets::Vault;
+use crate::state::{AppState, DiscordHandle};
 
 pub const ROOT_PW: &str = "root-password-123";
 pub const IP: &str = "127.0.0.1";
+/// The guild the fake Discord connection knows about. Above `i64::MAX` on purpose.
+pub const GUILD_ID: u64 = 9_300_000_000_000_000_001;
+pub const GUILD_NAME: &str = "Scorpio Test";
+pub const CHANNEL_ID: u64 = 9_300_000_000_000_000_002;
+pub const OTHER_CHANNEL_ID: u64 = 9_300_000_000_000_000_003;
+pub const VOICE_CHANNEL_ID: u64 = 9_300_000_000_000_000_004;
+pub const EMOJI_ID: u64 = 9_300_000_000_000_000_005;
+pub const MEMBER_ID: u64 = 9_300_000_000_000_000_010;
 
 /// Fresh migrated database. Every `:memory:` connection is its own database, so the pool
 /// holds exactly one connection and never recycles it.
@@ -36,17 +51,123 @@ pub async fn pool() -> SqlitePool {
     pool
 }
 
-/// Dashboard only state, like running without DISCORD_TOKEN.
-pub async fn state() -> AppState {
-    let config = Config {
+pub fn config() -> Config {
+    Config {
         discord_token: None,
         database_url: "sqlite::memory:".into(),
         web_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         cookie_secure: false,
         trust_proxy: false,
         root_password: None,
+        secrets_key: None,
+    }
+}
+
+/// Dashboard only state, like running without DISCORD_TOKEN.
+pub async fn state() -> AppState {
+    state_with(modules::registry()).await
+}
+
+pub async fn state_with(modules: Vec<Arc<dyn Module>>) -> AppState {
+    AppState::new(pool().await, config(), modules, Vault::ephemeral())
+}
+
+/// Pretends the bot is connected and member of one guild ([`GUILD_ID`]) with two text
+/// channels, a voice channel, a custom emoji and one member. Nothing talks to Discord: the
+/// cache is filled from a GUILD_CREATE payload and the shard manager never starts a shard.
+/// Any handler that calls the Discord HTTP API would fail, so tests avoid those paths.
+pub fn connect_fake_discord(state: &AppState) {
+    let cache = Arc::new(Cache::new());
+    let mut event: GuildCreateEvent =
+        serde_json::from_value(guild_json()).expect("guild fixture matches serenity's model");
+    cache.update(&mut event);
+
+    // Point the HTTP client at a closed local port: a handler that calls Discord by
+    // mistake fails fast instead of reaching discord.com.
+    let http = Arc::new(
+        HttpBuilder::new("test-token")
+            .proxy("http://127.0.0.1:9")
+            .ratelimiter_disabled(true)
+            .build(),
+    );
+    let (shard_manager, _) = ShardManager::new(ShardManagerOptions {
+        data: Default::default(),
+        event_handlers: Vec::new(),
+        raw_event_handlers: Vec::new(),
+        shard_index: 0,
+        shard_init: 0,
+        shard_total: 1,
+        ws_url: Default::default(),
+        cache: cache.clone(),
+        http: http.clone(),
+        intents: GatewayIntents::all(),
+        presence: None,
+    });
+    // Member lists come from HTTP in production; serve the fixture from the cache instead.
+    state
+        .members
+        .insert(GUILD_ID, members::from_cache(&cache, GUILD_ID));
+    let handle = DiscordHandle {
+        http,
+        cache,
+        shard_manager,
+        intents: GatewayIntents::all(),
     };
-    AppState::new(pool().await, config, modules::registry())
+    assert!(state.discord.set(handle).is_ok(), "already connected");
+}
+
+fn guild_json() -> serde_json::Value {
+    let channel = |id: u64, kind: u8, name: &str, position: u16| {
+        serde_json::json!({
+            "id": id.to_string(), "type": kind, "name": name, "position": position,
+            "guild_id": GUILD_ID.to_string(), "permission_overwrites": [], "nsfw": false
+        })
+    };
+    serde_json::json!({
+        "id": GUILD_ID.to_string(),
+        "name": GUILD_NAME,
+        "icon": null,
+        "owner_id": "1",
+        "default_message_notifications": 0,
+        "explicit_content_filter": 0,
+        "verification_level": 0,
+        "mfa_level": 0,
+        "nsfw_level": 0,
+        "premium_tier": 0,
+        "system_channel_flags": 0,
+        "preferred_locale": "en-US",
+        "features": [],
+        "premium_progress_bar_enabled": false,
+        "roles": [{
+            "id": GUILD_ID.to_string(), "name": "@everyone", "color": 0, "hoist": false,
+            "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
+            "managed": false, "mentionable": false, "permissions": "0", "position": 0, "flags": 0
+        }],
+        "emojis": [{
+            "id": EMOJI_ID.to_string(), "name": "party", "animated": false, "available": true,
+            "managed": false, "require_colons": true, "roles": []
+        }],
+        "stickers": [],
+        "joined_at": "2026-01-01T00:00:00.000000+00:00",
+        "large": false,
+        "unavailable": false,
+        "member_count": 2,
+        "voice_states": [],
+        "members": [{
+            "user": {"id": MEMBER_ID.to_string(), "username": "anna.nowak", "global_name": "Anna Nowak", "discriminator": "0", "avatar": null},
+            "nick": null, "roles": [], "joined_at": "2026-01-01T00:00:00.000000+00:00",
+            "deaf": false, "mute": false, "flags": 0
+        }],
+        "channels": [
+            channel(CHANNEL_ID, 0, "events", 0),
+            channel(OTHER_CHANNEL_ID, 0, "general", 1),
+            channel(VOICE_CHANNEL_ID, 2, "Voice", 2),
+        ],
+        "threads": [],
+        "presences": [],
+        "stage_instances": [],
+        "guild_scheduled_events": []
+    })
 }
 
 pub struct TestResponse {
@@ -77,17 +198,35 @@ impl TestResponse {
 /// The dashboard router with a root account, driven without a socket.
 pub struct TestApp {
     pub state: AppState,
+    /// Fake ClickUp API the app talks to.
+    pub clickup: MockClickUp,
     router: Router,
 }
 
 impl TestApp {
     pub async fn new() -> Self {
-        let state = state().await;
+        Self::from_state(state().await).await
+    }
+
+    /// Like [`new`](Self::new), with the bot connected to the fake guild [`GUILD_ID`].
+    pub async fn with_guild() -> Self {
+        let app = Self::new().await;
+        connect_fake_discord(&app.state);
+        app
+    }
+
+    async fn from_state(mut state: AppState) -> Self {
+        let clickup = MockClickUp::start().await;
+        state.clickup = clickup.client();
         auth::bootstrap_root(&state.db, Some(ROOT_PW))
             .await
             .unwrap();
         let router = crate::web::router(state.clone());
-        Self { state, router }
+        Self {
+            state,
+            clickup,
+            router,
+        }
     }
 
     pub async fn request(

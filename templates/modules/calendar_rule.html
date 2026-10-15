@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New {{ rule.kind.label() }}{% else %}{{ rule.name }}{% endif %} | Calendar{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}/modules/calendar">Calendar</a><span>/</span>
+  <span>{% if is_new %}New {{ rule.kind.label() }}{% else %}{{ rule.name }}{% endif %}</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>{% if is_new %}New {{ rule.kind.label() }}{% else %}{{ rule.name }}{% endif %}</h1>
+    <p class="muted">
+      {% if is_digest %}Posts the events of the coming hours on the days and at the time you choose.{% else %}Posts once for every event, a set time before it starts.{% endif %}
+    </p>
+  </div>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules{% if !is_new %}/{{ rule.id }}{% endif %}">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    {% if is_new %}<input type="hidden" name="kind" value="{{ rule.kind.as_str() }}">{% endif %}
+
+    <label>
+      <span>Name</span>
+      <input type="text" name="name" value="{{ rule.name }}" maxlength="60" required>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="enabled"{% if rule.enabled %} checked{% endif %}>
+      <span>Rule is active</span>
+    </label>
+    <label>
+      <span>Channel</span>
+      <select name="channel_id">
+        <option value="">Select a channel</option>
+        {% for c in channels %}
+        <option value="{{ c.id }}"{% if c.selected %} selected{% endif %}>#{{ c.name }}{% if !c.can_send %} (bot has no access){% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    {% if is_digest %}
+    <fieldset class="field-group">
+      <legend>Days</legend>
+      <div class="day-row">
+        {% for d in days %}
+        <label class="check"><input type="checkbox" name="day" value="{{ d.value }}"{% if d.checked %} checked{% endif %}><span>{{ d.label }}</span></label>
+        {% endfor %}
+      </div>
+    </fieldset>
+    <label class="inline-field">
+      <span>Time ({{ timezone }})</span>
+      <input type="time" name="time" value="{{ time }}" required>
+    </label>
+    <label class="inline-field">
+      <span>Include events of the next (hours)</span>
+      <input type="number" name="lookahead_hours" value="{{ rule.lookahead_hours }}" min="1" max="336" required>
+    </label>
+    <label>
+      <span>Layout</span>
+      <select name="layout">
+        <option value="combined"{% if !per_event %} selected{% endif %}>One message listing all events</option>
+        <option value="per_event"{% if per_event %} selected{% endif %}>One message per event</option>
+      </select>
+    </label>
+    <label class="inline-field">
+      <span>At most this many events</span>
+      <input type="number" name="max_events" value="{{ rule.max_events }}" min="1" max="50" required>
+    </label>
+    <label>
+      <span>Header (one message layout)</span>
+      <textarea name="header_template" id="header-tpl" rows="2" maxlength="{{ max_len }}" required>{{ rule.header_template }}</textarea>
+    </label>
+    <div class="chips" aria-label="Insert header placeholder">
+      {% for (token, _desc) in header_placeholders %}
+      <button type="button" class="chip" data-insert="{{ token }}" data-target="header-tpl">{{ token }}</button>
+      {% endfor %}
+    </div>
+    <label class="check">
+      <input type="checkbox" name="post_when_empty"{% if rule.post_when_empty %} checked{% endif %}>
+      <span>Post even when there are no events</span>
+    </label>
+    <label>
+      <span>Message when there are no events</span>
+      <textarea name="empty_template" rows="2" maxlength="{{ max_len }}" required>{{ rule.empty_template }}</textarea>
+    </label>
+    {% else %}
+    <label class="inline-field">
+      <span>Minutes before the event</span>
+      <input type="number" name="lead_minutes" value="{{ rule.lead_minutes }}" min="1" max="10080" required>
+    </label>
+    {% endif %}
+
+    <label>
+      <span>{% if is_digest %}Each event{% else %}Message{% endif %}</span>
+      <textarea name="item_template" id="item-tpl" rows="5" maxlength="{{ max_len }}" required>{{ rule.item_template }}</textarea>
+    </label>
+    <div class="chips" aria-label="Insert event placeholder">
+      {% for (token, _desc) in item_placeholders %}
+      <button type="button" class="chip" data-insert="{{ token }}" data-target="item-tpl">{{ token }}</button>
+      {% endfor %}
+    </div>
+    <label class="inline-field">
+      <span>Description length (0 hides it)</span>
+      <input type="number" name="description_max" value="{{ rule.description_max }}" min="0" max="1000" required>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="mention_assignees"{% if rule.mention_assignees %} checked{% endif %}>
+      <span>Ping assignees that are matched to server members</span>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="use_embed"{% if rule.use_embed %} checked{% endif %}>
+      <span>Send as embed</span>
+    </label>
+    <label class="inline-field">
+      <span>Embed color</span>
+      <input type="color" name="embed_color" value="{{ color }}">
+    </label>
+
+    <label>
+      <span>Reactions added to every message (up to 5)</span>
+      <input type="text" name="reactions" id="reactions" value="{{ reactions }}" placeholder="✅ ❌" autocomplete="off">
+    </label>
+    <div class="chips" aria-label="Add reaction">
+      {% for r in quick_reactions %}
+      <button type="button" class="chip emoji-chip" data-insert="{{ r }}" data-target="reactions" data-append="1">{{ r }}</button>
+      {% endfor %}
+      {% for e in emojis %}
+      <button type="button" class="chip emoji-chip" data-insert="{{ e.code }}" data-target="reactions" data-append="1" title=":{{ e.name }}:"><img src="{{ e.url }}" alt=":{{ e.name }}:" width="18" height="18"></button>
+      {% endfor %}
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">{% if is_new %}Create rule{% else %}Save rule{% endif %}</button>
+      <a class="btn btn-ghost" href="/guilds/{{ guild.id }}/modules/calendar">Back</a>
+    </div>
+  </form>
+
+  <div class="stack">
+    <section class="card">
+      <h2>Preview</h2>
+      {% if preview.is_empty() %}
+      <p class="muted">Nothing would be posted right now.</p>
+      {% else %}
+      <pre class="preview">{{ preview }}</pre>
+      {% endif %}
+      <p class="hint">The saved rule with current events from ClickUp (or a sample event). Times are shown in {{ timezone }}; in Discord everyone sees their own time zone.</p>
+      {% if !is_new %}
+      <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules/{{ rule.id }}/test" class="actions">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <button class="btn btn-secondary" type="submit">Send test message</button>
+      </form>
+      <p class="hint">Posts what this rule would post right now to its channel. Test messages never ping anyone.</p>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Placeholders</h2>
+      <table class="table compact">
+        <tbody>
+        {% for (token, desc) in item_placeholders %}
+        <tr><td><code>{{ token }}</code></td><td class="muted">{{ desc }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if is_digest %}
+      <p class="hint">In the header and the empty message: {% for (token, desc) in header_placeholders %}<code>{{ token }}</code> {{ desc|lower }}{% if !loop.last %}, {% endif %}{% endfor %}.</p>
+      {% endif %}
+      <p class="hint">Lines whose placeholders are all empty are left out. <code>@everyone</code> and role mentions never ping.</p>
+    </section>
+
+    {% if !is_new %}
+    <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules/{{ rule.id }}/delete" class="actions" data-confirm="Delete this rule?">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-danger" type="submit">Delete rule</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
