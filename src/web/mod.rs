@@ -1,4 +1,6 @@
 mod pages;
+#[cfg(test)]
+mod tests;
 
 use std::net::SocketAddr;
 

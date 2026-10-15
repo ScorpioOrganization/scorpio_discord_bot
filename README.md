@@ -103,7 +103,22 @@ The guild page lists the module with an enable/disable switch automatically, and
 
 ## Development
 
+Requires Rust 1.94 or newer (`rust-version` in `Cargo.toml`).
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo deny check   # needs cargo-deny, see deny.toml
 ```
+
+Tests run without Discord or a database file: dashboard tests drive the real router against an in-memory SQLite database (`src/test_util.rs`, `src/web/tests.rs`).
+
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `master`, on pull requests and weekly:
+
+- `rustfmt`, `clippy` (warnings are errors) and `cargo test` on stable
+- `msrv`: `cargo check` with the exact `rust-version` from `Cargo.toml`
+- `cargo-deny`: RustSec advisories, license allowlist, banned crates and sources. A new advisory does not fail pull requests, only the weekly run.
+- `docker`: builds the image, starts it without a token and checks `/healthz` and a root login

@@ -1,0 +1,43 @@
+# cargo-deny configuration, run in CI (.github/workflows/ci.yml) and locally with
+# `cargo deny check`. Docs: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Every ignore needs a reason and should be revisited when the dependency updates.
+#
+# rustls 0.22 / rustls-webpki 0.102 come only from serenity 0.12 -> tokio-tungstenite 0.21,
+# the TLS client for the Discord gateway websocket. Fixes exist only in rustls 0.23 and
+# webpki 0.103, which serenity 0.12.5 (latest) cannot use. REST calls go through reqwest
+# with patched versions. Drop these once serenity moves to a newer tokio-tungstenite.
+ignore = [
+    { id = "RUSTSEC-2026-0346", reason = "Debug of session values; only leaks via a custom ClientSessionStore that logs, none is used" },
+    { id = "RUSTSEC-2026-0349", reason = "key exchange downgrade needs an active network attacker; no fixed rustls 0.22, gateway only" },
+    { id = "RUSTSEC-2026-0049", reason = "CRL matching; the gateway client does not use CRLs" },
+    { id = "RUSTSEC-2026-0104", reason = "panic in CRL parsing; the gateway client does not use CRLs" },
+    { id = "RUSTSEC-2026-0098", reason = "URI name constraints; needs a misissuing CA, no fixed webpki 0.102, gateway only" },
+    { id = "RUSTSEC-2026-0099", reason = "wildcard name constraints; needs a misissuing CA, no fixed webpki 0.102, gateway only" },
+]
+
+[licenses]
+# Permissive licenses only. Most crates are dual licensed, only one side has to match.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA list)
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[licenses.private]
+# This crate itself is not published and has no license field.
+ignore = true
+
+[bans]
+# serenity, axum and sqlx pull in different major versions of a few crates.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

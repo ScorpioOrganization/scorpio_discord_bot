@@ -311,3 +311,94 @@ pub async fn load_stats(db: &SqlitePool, guild_id: u64) -> Result<GreetingStats>
         recent,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util;
+
+    fn vars() -> Vars {
+        Vars {
+            user_id: 42,
+            username: "new_guy".into(),
+            display_name: "New Guy".into(),
+            server: "Scorpio".into(),
+            member_count: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_defaults_then_upserts() {
+        let db = test_util::pool().await;
+        let cfg = load_config(&db, 1).await.unwrap();
+        assert_eq!(cfg.template, DEFAULT_TEMPLATE);
+        assert_eq!(cfg.channel_id, None);
+        assert_eq!(cfg.embed_color, i64::from(DEFAULT_EMBED_COLOR));
+
+        let mut cfg = GreetingConfig {
+            channel_id: Some(sf(u64::MAX - 1)),
+            template: "Hi {user}".into(),
+            use_embed: true,
+            embed_color: 0x123456,
+            greet_bots: true,
+        };
+        save_config(&db, 1, &cfg, "root").await.unwrap();
+        cfg.template = "Hello {user}".into();
+        save_config(&db, 1, &cfg, "alice").await.unwrap();
+
+        let loaded = load_config(&db, 1).await.unwrap();
+        assert_eq!(loaded.channel_id, cfg.channel_id);
+        assert_eq!(loaded.template, "Hello {user}");
+        assert!(loaded.use_embed && loaded.greet_bots);
+        assert_eq!(loaded.embed_color, 0x123456);
+        assert_eq!(
+            load_config(&db, 2).await.unwrap().template,
+            DEFAULT_TEMPLATE
+        );
+    }
+
+    #[tokio::test]
+    async fn attempts_feed_stats_but_tests_do_not_count() {
+        let db = test_util::pool().await;
+        let ok = Ok(());
+        let failed = Err("Missing Permissions".to_owned());
+        log_attempt(&db, 1, &vars(), &ok, false).await.unwrap();
+        log_attempt(&db, 1, &vars(), &ok, false).await.unwrap();
+        log_attempt(&db, 1, &vars(), &failed, false).await.unwrap();
+        log_attempt(&db, 1, &vars(), &ok, true).await.unwrap();
+        log_attempt(&db, 2, &vars(), &ok, false).await.unwrap();
+
+        let stats = load_stats(&db, 1).await.unwrap();
+        assert_eq!(stats.sent_total, 2);
+        assert_eq!(stats.failed_total, 1);
+        assert_eq!(stats.sent_24h, 2);
+        assert_eq!(stats.sent_7d, 2);
+        assert_eq!(stats.recent.len(), 4);
+        assert!(stats.recent[0].is_test);
+        let last_error = stats.last_error.unwrap();
+        assert_eq!(last_error.error.as_deref(), Some("Missing Permissions"));
+        assert_eq!(last_error.user_name, "New Guy");
+    }
+
+    #[tokio::test]
+    async fn prune_log_keeps_recent_rows_and_totals() {
+        let db = test_util::pool().await;
+        log_attempt(&db, 1, &vars(), &Ok(()), false).await.unwrap();
+        for age in [LOG_RETENTION_SECS + 60, 30 * 86400] {
+            sqlx::query(
+                "INSERT INTO greeting_log (guild_id, user_id, user_name, success, created_at)
+                 VALUES (1, 42, 'old', 1, ?)",
+            )
+            .bind(now() - age)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(prune_log(&db).await.unwrap(), 1);
+        assert_eq!(prune_log(&db).await.unwrap(), 0);
+        let stats = load_stats(&db, 1).await.unwrap();
+        assert_eq!(stats.recent.len(), 2);
+        assert_eq!(stats.sent_total, 1);
+    }
+}

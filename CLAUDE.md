@@ -18,7 +18,7 @@ We want it to:
 
 ## Commands
 
-Rust (edition 2024, uses let chains, so a recent stable toolchain is required). Cargo is installed on the host.
+Rust edition 2024, MSRV 1.94 (`rust-version` in `Cargo.toml`, set by sqlx 0.9; the CI `msrv` job reads it from there). Cargo is installed on the host.
 
 ```sh
 cargo build
@@ -29,9 +29,12 @@ cargo test locks_ip_after_limit    # single test by name (substring match)
 cargo test auth::                  # all tests in a module path
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+cargo deny check                   # advisories, licenses, bans, sources (deny.toml)
 docker compose up -d --build       # dashboard published on 127.0.0.1:8080
 docker compose logs bot            # first start prints the generated root password
 ```
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the MSRV check, cargo-deny and a docker build with a `/healthz` + login smoke test. Keep all of them green; CI uses `--locked`, so commit `Cargo.lock` changes. A new license in the dependency tree must be added to `deny.toml`.
 
 Config is read from env / `.env` (see `.env.example`, `src/config.rs`). A new env var must be added to `Config`, `.env.example` and the table in `README.md`. Without `DISCORD_TOKEN` only the dashboard runs, which is enough to work on the web side.
 
@@ -61,6 +64,13 @@ Every bot feature is a `Module` (`src/modules/mod.rs`) registered in `modules::r
 - Event dispatch is explicit: `Handler` in `src/bot/mod.rs` currently only routes `guild_member_addition` to `Module::on_member_join`, checking `is_enabled` per module. A new event type needs a default method on the trait plus a matching dispatch loop in `Handler`.
 - Log pruning is not part of the trait: `maintenance` in `main.rs` calls `greeting::prune_log` directly, so a new module with a log table needs its own call there.
 - Messages sent to Discord must restrict pings with `CreateAllowedMentions` (see `greeting::send`) so templates or user names cannot ping `@everyone` or roles.
+
+### Tests
+
+- Unit tests live next to the code in `#[cfg(test)] mod tests`. DB tests use `test_util::pool()` (in-memory SQLite, migrated, single connection because every `:memory:` connection is its own database).
+- Dashboard tests (`src/web/tests.rs`) use `test_util::TestApp`: the real `web::router` with a root account, driven with `tower::ServiceExt::oneshot` (no socket, no Discord, so `require_guild` 404s). Helpers: `login`, `login_from(ip, ..)`, `csrf`, `create_user`, `post`/`get` with a cookie, `TestResponse::redirect()`.
+- New routes need tests for: login required, CSRF rejected, root only where applicable, and the happy path redirect code.
+- Argon2 is built with `opt-level = 3` in the dev profile (`Cargo.toml`), otherwise login heavy tests take seconds.
 
 ### Web dashboard and security conventions
 

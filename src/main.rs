@@ -5,6 +5,8 @@ mod db;
 mod error;
 mod modules;
 mod state;
+#[cfg(test)]
+mod test_util;
 mod web;
 
 use std::time::Duration;

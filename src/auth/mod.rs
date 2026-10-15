@@ -272,4 +272,89 @@ mod tests {
         assert_eq!(hash_token("x"), hash_token("x"));
         assert_eq!(random_password().len(), 24);
     }
+
+    async fn root_id(db: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT id FROM users WHERE is_root = 1")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    async fn root_hash(db: &SqlitePool) -> String {
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE is_root = 1")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_root_runs_once() {
+        let db = crate::test_util::pool().await;
+        assert!(bootstrap_root(&db, Some("short")).await.is_err());
+
+        let generated = bootstrap_root(&db, None).await.unwrap().unwrap();
+        assert_eq!(generated.len(), 24);
+        assert!(verify_password(generated, Some(root_hash(&db).await)).await);
+
+        // Existing root is never touched again, ROOT_PASSWORD only applies on creation.
+        assert_eq!(
+            bootstrap_root(&db, Some("other-password-1")).await.unwrap(),
+            None
+        );
+        assert!(!verify_password("other-password-1".into(), Some(root_hash(&db).await)).await);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_root_with_configured_password() {
+        let db = crate::test_util::pool().await;
+        assert_eq!(
+            bootstrap_root(&db, Some("configured-pw-1")).await.unwrap(),
+            None
+        );
+        assert!(verify_password("configured-pw-1".into(), Some(root_hash(&db).await)).await);
+    }
+
+    #[tokio::test]
+    async fn sessions_store_only_hash_and_expire() {
+        let db = crate::test_util::pool().await;
+        bootstrap_root(&db, None).await.unwrap();
+        let token = create_session(&db, root_id(&db).await).await.unwrap();
+
+        let stored: String = sqlx::query_scalar("SELECT token_hash FROM sessions")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(stored, hash_token(&token));
+        assert_ne!(stored, token);
+
+        let user = load_session(&db, &token).await.unwrap().unwrap();
+        assert_eq!(user.username, ROOT_USERNAME);
+        assert!(user.is_root);
+        assert_eq!(user.csrf.len(), 64);
+        assert!(load_session(&db, "not-a-token").await.unwrap().is_none());
+
+        sqlx::query("UPDATE sessions SET expires_at = ?")
+            .bind(now() - 1)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(load_session(&db, &token).await.unwrap().is_none());
+        assert_eq!(delete_expired_sessions(&db).await.unwrap(), 1);
+        assert_eq!(delete_expired_sessions(&db).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reset_root_password_signs_root_out() {
+        let db = crate::test_util::pool().await;
+        assert!(reset_root_password(&db).await.is_err());
+
+        bootstrap_root(&db, Some("configured-pw-1")).await.unwrap();
+        let token = create_session(&db, root_id(&db).await).await.unwrap();
+        let password = reset_root_password(&db).await.unwrap();
+
+        assert!(load_session(&db, &token).await.unwrap().is_none());
+        let hash = root_hash(&db).await;
+        assert!(verify_password(password, Some(hash.clone())).await);
+        assert!(!verify_password("configured-pw-1".into(), Some(hash)).await);
+    }
 }

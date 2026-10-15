@@ -147,3 +147,59 @@ pub async fn counter(
         };
     Ok(value.unwrap_or(0))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util;
+
+    #[tokio::test]
+    async fn modules_off_by_default_and_toggle_per_guild() {
+        let db = test_util::pool().await;
+        assert!(!is_enabled(&db, 1, "greeting").await.unwrap());
+        assert_eq!(enabled_count(&db, 1).await.unwrap(), 0);
+
+        set_enabled(&db, 1, "greeting", true).await.unwrap();
+        set_enabled(&db, 1, "other", true).await.unwrap();
+        assert!(is_enabled(&db, 1, "greeting").await.unwrap());
+        assert!(!is_enabled(&db, 2, "greeting").await.unwrap());
+        assert_eq!(enabled_count(&db, 1).await.unwrap(), 2);
+
+        set_enabled(&db, 1, "greeting", false).await.unwrap();
+        assert!(!is_enabled(&db, 1, "greeting").await.unwrap());
+        assert_eq!(enabled_count(&db, 1).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn counters_per_guild_and_total() {
+        let db = test_util::pool().await;
+        assert_eq!(counter(&db, Some(1), "m", "sent").await.unwrap(), 0);
+        assert_eq!(counter(&db, None, "m", "sent").await.unwrap(), 0);
+
+        for _ in 0..3 {
+            bump_counter(&db, 1, "m", "sent").await.unwrap();
+        }
+        bump_counter(&db, 2, "m", "sent").await.unwrap();
+        bump_counter(&db, 2, "m", "failed").await.unwrap();
+        bump_counter(&db, 2, "other", "sent").await.unwrap();
+
+        assert_eq!(counter(&db, Some(1), "m", "sent").await.unwrap(), 3);
+        assert_eq!(counter(&db, Some(2), "m", "sent").await.unwrap(), 1);
+        assert_eq!(counter(&db, None, "m", "sent").await.unwrap(), 4);
+        assert_eq!(counter(&db, None, "m", "failed").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn snowflakes_above_i64_max_round_trip() {
+        let db = test_util::pool().await;
+        let gid = u64::MAX - 5;
+        set_enabled(&db, gid, "greeting", true).await.unwrap();
+        bump_counter(&db, gid, "greeting", "sent").await.unwrap();
+        assert!(is_enabled(&db, gid, "greeting").await.unwrap());
+        assert!(!is_enabled(&db, gid - 1, "greeting").await.unwrap());
+        assert_eq!(
+            counter(&db, Some(gid), "greeting", "sent").await.unwrap(),
+            1
+        );
+    }
+}

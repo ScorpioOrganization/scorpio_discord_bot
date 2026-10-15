@@ -2,6 +2,9 @@
 name = "scorpio-discord-bot"
 version = "0.1.0"
 edition = "2024"
+# Floor set by sqlx 0.9. The msrv CI job builds with exactly this version.
+rust-version = "1.94"
+publish = false
 
 [dependencies]
 anyhow = "1"
@@ -25,3 +28,14 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+# Argon2 without optimizations takes about half a second per hash, which makes debug
+# logins and the test suite crawl.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
