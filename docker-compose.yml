@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    image: scorpio-discord-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:///data/scorpio.db?mode=rwc
+      WEB_BIND: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - scorpio-data:/data
+
+volumes:
+  scorpio-data:

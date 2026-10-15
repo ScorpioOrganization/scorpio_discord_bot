@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Account{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Account</h1>
+    <p class="muted">Signed in as <strong>{{ page.username }}</strong>{% if page.is_root %} (root){% endif %}.</p>
+  </div>
+</header>
+
+<section class="card narrow">
+  <h2>Change password</h2>
+  <form method="post" action="/account/password" class="form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>
+      <span>Current password</span>
+      <input type="password" name="current" autocomplete="current-password" required>
+    </label>
+    <label>
+      <span>New password</span>
+      <input type="password" name="new" autocomplete="new-password" minlength="{{ min_len }}" maxlength="256" required>
+    </label>
+    <label>
+      <span>Repeat new password</span>
+      <input type="password" name="confirm" autocomplete="new-password" minlength="{{ min_len }}" maxlength="256" required>
+    </label>
+    <p class="hint">At least {{ min_len }} characters. Other sessions are signed out after the change.</p>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">Change password</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

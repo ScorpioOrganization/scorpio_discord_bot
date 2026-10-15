@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Users</h1>
+    <p class="muted">Dashboard accounts. Every account can view statistics and change bot settings. Only root can manage accounts.</p>
+  </div>
+</header>
+
+<div class="two-col wide-right">
+  <section class="card">
+    <h2>New account</h2>
+    <form method="post" action="/users" class="form">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <label>
+        <span>Username</span>
+        <input type="text" name="username" autocomplete="off" autocapitalize="none" spellcheck="false" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.\-]+" required>
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" name="password" autocomplete="new-password" minlength="{{ min_len }}" maxlength="256" required>
+      </label>
+      <label>
+        <span>Repeat password</span>
+        <input type="password" name="confirm" autocomplete="new-password" minlength="{{ min_len }}" maxlength="256" required>
+      </label>
+      <p class="hint">Share the password with the person directly. They can change it on their Account page.</p>
+      <div class="actions">
+        <button class="btn btn-primary" type="submit">Create account</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Accounts</h2>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Username</th><th>Created</th><th>Last login</th><th></th></tr></thead>
+        <tbody>
+        {% for u in users %}
+        <tr>
+          <td>
+            {{ u.username }}
+            {% if u.is_root %}<span class="badge badge-accent">root</span>{% endif %}
+          </td>
+          <td><time data-ts="{{ u.created_at }}">{{ u.created() }}</time></td>
+          <td>{% if let Some(ts) = u.last_login_at %}<time data-ts="{{ ts }}">{{ u.last_login() }}</time>{% else %}<span class="muted">Never</span>{% endif %}</td>
+          <td>
+            {% if !u.is_root %}
+            <div class="row-actions">
+            <details class="popover">
+              <summary class="btn btn-ghost btn-sm">Reset password</summary>
+              <form method="post" action="/users/{{ u.id }}/password" class="form popover-body">
+                <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+                <input type="password" name="password" placeholder="New password" autocomplete="new-password" minlength="{{ min_len }}" maxlength="256" required>
+                <input type="password" name="confirm" placeholder="Repeat password" autocomplete="new-password" minlength="{{ min_len }}" maxlength="256" required>
+                <button class="btn btn-primary btn-sm" type="submit">Set password</button>
+              </form>
+            </details>
+            <form method="post" action="/users/{{ u.id }}/delete" data-confirm="Delete account {{ u.username }}? This cannot be undone.">
+              <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+              <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+            </form>
+            </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

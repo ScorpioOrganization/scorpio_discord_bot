@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0e1014">
+  <title>{% block title %}Dashboard{% endblock %} | Scorpio</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v={{ page.version }}">
+  <script src="/static/app.js?v={{ page.version }}" defer></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="/">
+      <img src="/favicon.svg" alt="" width="28" height="28">
+      <span>Scorpio</span>
+    </a>
+    <nav class="nav">
+      <a href="/" class="{% if page.nav == "overview" || page.nav == "guilds" %}active{% endif %}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4zm0 7h6v-5H4zm10 0h6v-9h-6zm0-16v5h6V4z"/></svg>
+        Overview
+      </a>
+      <a href="/account" class="{% if page.nav == "account" %}active{% endif %}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8m0 2c-4 0-8 2-8 5v1h16v-1c0-3-4-5-8-5"/></svg>
+        Account
+      </a>
+      {% if page.is_root %}
+      <a href="/users" class="{% if page.nav == "users" %}active{% endif %}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7m7 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6M9 13c-3.3 0-7 1.6-7 4.5V19h14v-1.5C16 14.6 12.3 13 9 13m7 0c-.5 0-1 0-1.5.1 1.5 1 2.5 2.4 2.5 4.4V19h5v-1.5c0-2.9-3.3-4.5-6-4.5"/></svg>
+        Users
+      </a>
+      {% endif %}
+    </nav>
+    <div class="sidebar-foot">
+      <div class="who">
+        <span class="muted small">Signed in as</span>
+        <strong>{{ page.username }}</strong>
+      </div>
+      <form method="post" action="/logout">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <button class="btn btn-ghost btn-sm" type="submit">Sign out</button>
+      </form>
+    </div>
+  </aside>
+
+  <main class="content">
+    {% if let Some(f) = page.flash %}
+    <div class="flash {% if f.ok %}flash-ok{% else %}flash-err{% endif %}" role="status">{{ f.text }}</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}Greeting | {{ guild.name }}{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <span>Greeting</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>Greeting</h1>
+    <p class="muted">Welcome new members with a message in a channel of your choice.</p>
+  </div>
+  <form method="post" action="/guilds/{{ guild.id }}/modules/greeting/toggle" class="toggle-form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <input type="hidden" name="back" value="module">
+    {% if enabled %}
+    <span class="badge badge-on">Enabled</span>
+    <input type="hidden" name="enabled" value="0">
+    <button class="btn btn-ghost" type="submit">Disable</button>
+    {% else %}
+    <span class="badge badge-off">Disabled</span>
+    <input type="hidden" name="enabled" value="1">
+    <button class="btn btn-primary" type="submit">Enable</button>
+    {% endif %}
+  </form>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/greeting" id="greeting-form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <h2>Settings</h2>
+
+    <label>
+      <span>Channel</span>
+      <select name="channel_id">
+        <option value="">Select a channel</option>
+        {% for c in channels %}
+        <option value="{{ c.id }}"{% if c.selected %} selected{% endif %}>#{{ c.name }}{% if !c.can_send %} (bot has no access){% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>
+      <span class="label-row">
+        <span>Message</span>
+        <span class="muted small"><span id="tpl-count">0</span> / {{ max_len }}</span>
+      </span>
+      <textarea name="template" id="tpl" rows="6" maxlength="{{ max_len }}" required spellcheck="true">{{ template }}</textarea>
+    </label>
+    <div class="chips" aria-label="Insert placeholder">
+      {% for (token, _desc) in placeholders %}
+      <button type="button" class="chip" data-insert="{{ token }}">{{ token }}</button>
+      {% endfor %}
+    </div>
+
+    <label class="check">
+      <input type="checkbox" name="use_embed" id="use-embed"{% if use_embed %} checked{% endif %}>
+      <span>Send as embed</span>
+    </label>
+    <label class="inline-field">
+      <span>Embed color</span>
+      <input type="color" name="embed_color" id="embed-color" value="{{ embed_color }}">
+    </label>
+    <label class="check">
+      <input type="checkbox" name="greet_bots"{% if greet_bots %} checked{% endif %}>
+      <span>Also greet bots that join</span>
+    </label>
+
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">Save settings</button>
+    </div>
+  </form>
+
+  <div class="stack">
+    <section class="card">
+      <h2>Preview</h2>
+      <div class="dp" id="preview" data-server="{{ guild.name }}" data-count="{{ guild.member_count }}">
+        <span class="dp-avatar"></span>
+        <div class="dp-body">
+          <div class="dp-head"><span class="dp-name">{{ bot_name }}</span><span class="dp-tag">APP</span></div>
+          <div class="dp-text" id="preview-text"></div>
+          <div class="dp-embed" id="preview-embed" hidden>
+            <div class="dp-text" id="preview-embed-text"></div>
+          </div>
+        </div>
+      </div>
+      <p class="hint">Live preview of unsaved changes, using a sample member called NewMember.</p>
+      <form method="post" action="/guilds/{{ guild.id }}/modules/greeting/test" class="actions">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <button class="btn btn-secondary" type="submit">Send test message</button>
+      </form>
+      <p class="hint">Posts the saved message to the selected channel, with the bot as the sample member. Nobody is pinged.</p>
+    </section>
+
+    <section class="card">
+      <h2>Placeholders</h2>
+      <table class="table compact">
+        <tbody>
+        {% for (token, desc) in placeholders %}
+        <tr><td><code>{{ token }}</code></td><td class="muted">{{ desc }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">Text such as <code>**bold**</code> uses normal Discord formatting. Only the new member can be pinged, <code>@everyone</code> and role mentions are always blocked.</p>
+    </section>
+  </div>
+</div>
+
+<h2 class="section-title">Statistics</h2>
+<section class="stats-grid">
+  <div class="stat"><span class="stat-label">Sent, all time</span><span class="stat-value">{{ stats.sent_total }}</span></div>
+  <div class="stat"><span class="stat-label">Last 24 hours</span><span class="stat-value">{{ stats.sent_24h }}</span></div>
+  <div class="stat"><span class="stat-label">Last 7 days</span><span class="stat-value">{{ stats.sent_7d }}</span></div>
+  <div class="stat"><span class="stat-label">Failed, all time</span><span class="stat-value{% if stats.failed_total > 0 %} text-err{% endif %}">{{ stats.failed_total }}</span></div>
+</section>
+
+{% if let Some(e) = stats.last_error %}
+<div class="callout callout-err">
+  <strong>Last error</strong> (<time data-ts="{{ e.timestamp() }}">{{ e.time() }}</time>): {{ e.error_text() }}
+</div>
+{% endif %}
+
+<section class="card">
+  <h2>Recent activity</h2>
+  {% if stats.recent.is_empty() %}
+  <p class="muted">Nothing yet. Greetings and test messages will show up here.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Time</th><th>Member</th><th>Result</th></tr></thead>
+      <tbody>
+      {% for r in stats.recent %}
+      <tr>
+        <td><time data-ts="{{ r.timestamp() }}">{{ r.time() }}</time></td>
+        <td>{{ r.user_name }}{% if r.is_test %} <span class="badge badge-muted">test</span>{% endif %}</td>
+        <td>
+          {% if r.success %}
+          <span class="badge badge-on">Sent</span>
+          {% else %}
+          <span class="badge badge-err" title="{{ r.error_text() }}">Failed</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

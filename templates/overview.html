@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Overview</h1>
+    <p class="muted">Bot status and the servers it is in.</p>
+  </div>
+</header>
+
+{% if !token_configured %}
+<div class="callout callout-warn">
+  No <code>DISCORD_TOKEN</code> is configured, so the bot is not connected. The dashboard still works.
+  Add the token to <code>.env</code> and restart to bring the bot online.
+</div>
+{% endif %}
+
+<section class="card bot-card">
+  {% if let Some(avatar) = bot.avatar %}
+  <img class="avatar-lg" src="{{ avatar }}" alt="">
+  {% else %}
+  <span class="avatar-lg avatar-empty"></span>
+  {% endif %}
+  <div class="bot-meta">
+    <h2>{% if let Some(name) = bot.name %}{{ name }}{% else %}Bot{% endif %}</h2>
+    <div class="bot-status">
+      <span class="dot {% if bot.online %}dot-on{% else %}dot-off{% endif %}"></span>
+      <span>{{ bot.stage }}</span>
+      {% if let Some(ms) = bot.latency_ms %}<span class="muted">, {{ ms }} ms gateway latency</span>{% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="stats-grid">
+  <div class="stat"><span class="stat-label">Uptime</span><span class="stat-value">{{ uptime }}</span></div>
+  <div class="stat"><span class="stat-label">Servers</span><span class="stat-value">{{ guild_count }}</span></div>
+  <div class="stat"><span class="stat-label">Members</span><span class="stat-value">{{ member_total }}</span></div>
+  <div class="stat"><span class="stat-label">Joins since start</span><span class="stat-value">{{ member_joins }}</span></div>
+  <div class="stat"><span class="stat-label">Events handled</span><span class="stat-value">{{ events_handled }}</span></div>
+  <div class="stat"><span class="stat-label">Greetings sent</span><span class="stat-value">{{ greetings_total }}</span></div>
+</section>
+
+<h2 class="section-title">Servers</h2>
+{% if guilds.is_empty() %}
+<div class="card empty">
+  <p>The bot is not in any server yet{% if !bot.online %}, or it is still connecting{% endif %}.</p>
+  <p class="muted small">Invite it with the OAuth2 URL generator in the Discord developer portal (scopes: bot; permissions: View Channels, Send Messages, Embed Links).</p>
+</div>
+{% else %}
+<div class="guild-grid">
+  {% for row in guilds %}
+  <a class="card guild-tile" href="/guilds/{{ row.guild.id }}">
+    {% if let Some(icon) = row.guild.icon %}
+    <img class="guild-icon" src="{{ icon }}" alt="">
+    {% else %}
+    <span class="guild-icon guild-initials">{{ row.guild.initials() }}</span>
+    {% endif %}
+    <span class="guild-text">
+      <span class="guild-name">{{ row.guild.name }}</span>
+      <span class="muted small">{{ row.guild.member_count }} members</span>
+      <span class="muted small">{{ row.modules_enabled }} of {{ module_count }} modules enabled</span>
+    </span>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

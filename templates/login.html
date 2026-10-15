@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0e1014">
+  <title>Sign in | Scorpio</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="center-page">
+  <main class="login-card card">
+    <div class="login-brand">
+      <img src="/favicon.svg" alt="" width="40" height="40">
+      <div>
+        <h1>Scorpio</h1>
+        <p class="muted">Bot dashboard</p>
+      </div>
+    </div>
+    {% if let Some(e) = error %}
+    <div class="flash flash-err" role="alert">{{ e }}</div>
+    {% endif %}
+    <form method="post" action="/login" class="form">
+      <label>
+        <span>Username</span>
+        <input type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button class="btn btn-primary btn-block" type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>
