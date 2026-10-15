@@ -1,8 +1,11 @@
 services:
   bot:
+    image: scorpioorganization/scorpio-discord-bot:latest
     build: .
-    image: scorpio-discord-bot
     restart: unless-stopped
+    # Run as the host user so files in ./data belong to you. Set PUID / PGID in .env
+    # when `id -u` / `id -g` is not 1000.
+    user: "${PUID:-1000}:${PGID:-1000}"
     env_file: .env
     environment:
       DATABASE_URL: sqlite:///data/scorpio.db?mode=rwc
@@ -10,7 +13,10 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - scorpio-data:/data
-
-volumes:
-  scorpio-data:
+      # Bind mount, not a named volume. Run `mkdir -p data` first: Docker would otherwise
+      # create the directory owned by root and the bot could not write to it.
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false

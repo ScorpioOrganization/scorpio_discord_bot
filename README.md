@@ -19,12 +19,25 @@ Modules:
 cp .env.example .env   # then fill in DISCORD_TOKEN
 ```
 
-With Docker:
+With Docker, using the prebuilt image from Docker Hub (`scorpioorganization/scorpio-discord-bot`, `linux/amd64` and `linux/arm64`). Only `docker-compose.yml` and `.env` are needed on the host, no source checkout:
 
 ```sh
-docker compose up -d --build
+mkdir -p data
+docker compose pull
+docker compose up -d
 docker compose logs bot   # first start prints the generated root password
 ```
+
+Update later with `docker compose pull && docker compose up -d`. Tags are `latest` and `sha-<commit>` for pinning a specific build.
+
+With Docker, building from source:
+
+```sh
+mkdir -p data
+docker compose up -d --build
+```
+
+The database lives in `./data`, a bind mounted directory. Create it before the first start, otherwise Docker refuses to start the container (it would create it owned by root). The container runs as uid/gid 1000 so the files belong to you; set `PUID` and `PGID` in `.env` if `id -u` / `id -g` differ.
 
 The compose file publishes the dashboard on `127.0.0.1:8080` only. Put a reverse proxy with HTTPS in front of it if it should be reachable from other machines, and set `COOKIE_SECURE=true` (and `TRUST_PROXY=true` if the proxy sets `X-Forwarded-For`).
 
@@ -122,3 +135,4 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `master`, on p
 - `msrv`: `cargo check` with the exact `rust-version` from `Cargo.toml`
 - `cargo-deny`: RustSec advisories, license allowlist, banned crates and sources. A new advisory does not fail pull requests, only the weekly run.
 - `docker`: builds the image, starts it without a token and checks `/healthz` and a root login
+- `publish`: only on pushes to `master` (or a manual run on `master`) and only after every job above passed. Builds `linux/amd64` and `linux/arm64` on native runners and pushes `scorpioorganization/scorpio-discord-bot` to Docker Hub tagged `latest` and `sha-<commit>`. Needs the repository secret `DOCKER_HUB` (a Docker Hub access token with write access); the login name is `DOCKERHUB_USERNAME` in the workflow `env`.

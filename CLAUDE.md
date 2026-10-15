@@ -30,11 +30,12 @@ cargo test auth::                  # all tests in a module path
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 cargo deny check                   # advisories, licenses, bans, sources (deny.toml)
+mkdir -p data                      # bind mounted at /data, must exist before compose up
 docker compose up -d --build       # dashboard published on 127.0.0.1:8080
 docker compose logs bot            # first start prints the generated root password
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the MSRV check, cargo-deny and a docker build with a `/healthz` + login smoke test. Keep all of them green; CI uses `--locked`, so commit `Cargo.lock` changes. A new license in the dependency tree must be added to `deny.toml`.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the MSRV check, cargo-deny and a docker build with a `/healthz` + login smoke test. Keep all of them green; CI uses `--locked`, so commit `Cargo.lock` changes. A new license in the dependency tree must be added to `deny.toml`. On `master` pushes, after all of those pass, the `publish` jobs build `linux/amd64` + `linux/arm64` on native runners and push `scorpioorganization/scorpio-discord-bot` (`latest`, `sha-<commit>`) to Docker Hub using the `DOCKER_HUB` secret. The image must keep building for arm64.
 
 Config is read from env / `.env` (see `.env.example`, `src/config.rs`). A new env var must be added to `Config`, `.env.example` and the table in `README.md`. Without `DISCORD_TOKEN` only the dashboard runs, which is enough to work on the web side.
 
