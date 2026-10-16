@@ -18,6 +18,16 @@ pub fn parse_tz(name: &str) -> Option<TimeZone> {
     TimeZone::get(name).ok()
 }
 
+/// The canonical name of a time zone typed by a user, or None when it is unknown.
+pub fn tz_name(raw: &str) -> Option<String> {
+    let tz = parse_tz(raw)?;
+    Some(
+        tz.iana_name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| raw.trim().to_owned()),
+    )
+}
+
 /// Every time zone name the bundled database knows, sorted.
 pub fn tz_names() -> &'static [String] {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -176,6 +186,8 @@ mod tests {
         assert!(parse_tz(" Europe/Warsaw ").is_some());
         assert!(parse_tz("Mars/Olympus").is_none());
         assert!(parse_tz("").is_none());
+        assert_eq!(tz_name(" Europe/Warsaw ").as_deref(), Some("Europe/Warsaw"));
+        assert!(tz_name("Mars/Olympus").is_none());
         assert!(tz_names().iter().any(|n| n == "Europe/Warsaw"));
     }
 

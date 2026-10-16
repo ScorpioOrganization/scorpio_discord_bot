@@ -4,10 +4,10 @@ use crate::auth::ROOT_USERNAME;
 use crate::clickup::mapping::Explicit;
 use crate::clickup::{mock, tokens};
 use crate::modules::calendar::{self, Kind, Rule};
-use crate::modules::clickup::explicit_mappings;
+use crate::modules::clickup::{explicit_mappings, set_tag_role, tag_role_rows};
 use crate::test_util::{
-    CHANNEL_ID, EMOJI_ID, GUILD_ID, GUILD_NAME, IP, MEMBER_ID, ROOT_PW, TestApp, TestResponse,
-    VOICE_CHANNEL_ID,
+    CHANNEL_ID, EMOJI_ID, GUILD_ID, GUILD_NAME, IP, LEADS_ROLE_ID, MEMBER_ID, ROLE_ID, ROOT_PW,
+    TestApp, TestResponse, VOICE_CHANNEL_ID,
 };
 
 const USER_PW: &str = "user-password-123";
@@ -360,6 +360,10 @@ async fn guild_routes_404_without_discord() {
             vec![("team_id", mock::TEAM_ID)],
         ),
         ("/guilds/1/modules/clickup/mapping", vec![("map_3", "-")]),
+        (
+            "/guilds/1/modules/clickup/tag-roles",
+            vec![("new_tag", "meeting"), ("new_role", "5")],
+        ),
         ("/guilds/1/modules/clickup/members/refresh", vec![]),
         ("/guilds/1/modules/calendar/toggle", vec![("enabled", "1")]),
         (
@@ -391,6 +395,7 @@ async fn guild_routes_404_without_discord() {
         "SELECT (SELECT COUNT(*) FROM greeting_config) + (SELECT COUNT(*) FROM clickup_tokens)
               + (SELECT COUNT(*) FROM clickup_config) + (SELECT COUNT(*) FROM clickup_user_map)
               + (SELECT COUNT(*) FROM clickup_token_source)
+              + (SELECT COUNT(*) FROM clickup_tag_roles)
               + (SELECT COUNT(*) FROM calendar_config) + (SELECT COUNT(*) FROM calendar_rules)",
     )
     .fetch_one(db)
@@ -523,13 +528,14 @@ async fn greeting_toggle_and_save() {
     assert_eq!(cfg.embed_color, 0x123456);
 }
 
-const CLICKUP_ROUTES: [&str; 6] = [
+const CLICKUP_ROUTES: [&str; 7] = [
     "/token",
     "/token/delete",
     "/test",
     "/workspace",
     "/mapping",
     "/members/refresh",
+    "/tag-roles",
 ];
 
 fn clickup_path(suffix: &str) -> String {
@@ -736,6 +742,109 @@ async fn clickup_workspace_and_mappings() {
 }
 
 #[tokio::test]
+async fn clickup_tag_roles() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+    let role = ROLE_ID.to_string();
+    let leads = LEADS_ROLE_ID.to_string();
+    let everyone = GUILD_ID.to_string();
+
+    // Without a key or workspace only the "other tag" row is there.
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(res.body.contains("Tags to roles"));
+    assert!(res.body.contains("@Team"));
+    assert!(res.body.contains("@Leads (not mentionable)"));
+    assert!(!res.body.contains("@@everyone"), "@everyone is not offered");
+    assert!(!res.body.contains(r#"name="tag_0""#));
+
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("new_tag", " Meeting "),
+        ("new_role", role.as_str()),
+    ];
+    let res = app
+        .post(&clickup_path("/tag-roles"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=tag_roles_saved"));
+    let rows = tag_role_rows(db, GUILD_ID).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].tag, "meeting");
+    assert_eq!(rows[0].role_id as u64, ROLE_ID);
+
+    // Tags of the selected workspace are listed next to the saved ones.
+    save_clickup_key(&app, &cookie, &csrf).await;
+    let form = [("_csrf", csrf.as_str()), ("team_id", mock::TEAM_ID)];
+    let res = app
+        .post(&clickup_path("/workspace"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=workspace_saved"));
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(
+        res.body.contains(r#"name="tag_0" value="meeting""#),
+        "{}",
+        res.body
+    );
+    assert!(res.body.contains(r#"name="tag_1" value="team sync""#));
+    assert!(
+        res.body
+            .contains(&format!(r#"<option value="{ROLE_ID}" selected>"#))
+    );
+
+    // Remap, add and remove in one save; an unknown role or bad tag changes nothing.
+    for (tag, role_raw, code) in [
+        ("team sync", "12345", "role_unknown"),
+        ("team sync", everyone.as_str(), "role_unknown"),
+        ("team sync", "abc", "role_unknown"),
+        (" ", leads.as_str(), "tag_invalid"),
+    ] {
+        let form = [
+            ("_csrf", csrf.as_str()),
+            ("tag_0", "meeting"),
+            ("role_0", ""),
+            ("tag_1", tag),
+            ("role_1", role_raw),
+        ];
+        let res = app
+            .post(&clickup_path("/tag-roles"), Some(&cookie), &form)
+            .await;
+        assert_eq!(
+            res.redirect(),
+            clickup_path(&format!("?msg={code}")),
+            "{role_raw}"
+        );
+        assert_eq!(tag_role_rows(db, GUILD_ID).await.unwrap().len(), 1);
+    }
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("tag_0", "meeting"),
+        ("role_0", ""),
+        ("tag_1", "team sync"),
+        ("role_1", leads.as_str()),
+        ("new_tag", "standup"),
+        ("new_role", role.as_str()),
+    ];
+    let res = app
+        .post(&clickup_path("/tag-roles"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), clickup_path("?msg=tag_roles_saved"));
+    let rows = tag_role_rows(db, GUILD_ID).await.unwrap();
+    let pairs: Vec<(&str, u64)> = rows
+        .iter()
+        .map(|r| (r.tag.as_str(), r.role_id as u64))
+        .collect();
+    assert_eq!(pairs, [("standup", ROLE_ID), ("team sync", LEADS_ROLE_ID)]);
+
+    // A mapping to a role deleted in Discord is flagged.
+    set_tag_role(db, GUILD_ID, "old", Some(999), "root")
+        .await
+        .unwrap();
+    let res = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(res.body.contains("mapped role was deleted"));
+}
+
+#[tokio::test]
 async fn every_account_can_configure_clickup() {
     let app = TestApp::with_guild().await;
     let root = app.login_root().await;
@@ -795,6 +904,7 @@ fn digest_form(csrf: &str) -> Vec<(&'static str, String)> {
         ("embed_color", "#7f8cff".into()),
         ("description_max", "200".into()),
         ("reactions", format!("✅ <:party:{EMOJI_ID}>")),
+        ("timezone", "Europe/Warsaw".into()),
     ]
 }
 
@@ -1047,6 +1157,11 @@ async fn calendar_rule_create_validate_edit_delete() {
         res.body.contains(&format!("&#60;:party:{EMOJI_ID}&#62;")),
         "emoji chips"
     );
+    assert!(
+        res.body
+            .contains(r#"id="rule-tz" value="UTC" list="time-zones" required autocomplete="off" data-detect-tz"#),
+        "new rules start from the default zone and take the browser's"
+    );
     let res = app
         .get(&calendar_path("/rules/new?kind=weekly"), Some(&cookie))
         .await;
@@ -1065,6 +1180,9 @@ async fn calendar_rule_create_validate_edit_delete() {
         ("max_events", Some("51"), "rule_max_events"),
         ("item_template", Some("  "), "template_empty"),
         ("header_template", Some(long.as_str()), "template_long"),
+        ("empty_template", Some(" "), "template_empty"),
+        ("timezone", Some("Mars/Olympus"), "timezone_invalid"),
+        ("timezone", None, "timezone_invalid"),
         ("embed_color", Some("red"), "invalid_color"),
         ("description_max", Some("5000"), "rule_description_max"),
         ("reactions", Some("nope"), "reactions_invalid"),
@@ -1098,7 +1216,8 @@ async fn calendar_rule_create_validate_edit_delete() {
     assert_eq!(rule.time_of_day, 8 * 60 + 30);
     assert_eq!(rule.channel_id, Some(CHANNEL_ID));
     assert_eq!(rule.reactions.len(), 2);
-    assert!(rule.enabled && !rule.mention_assignees);
+    assert_eq!(rule.timezone, "Europe/Warsaw");
+    assert!(rule.enabled && !rule.mention_assignees && !rule.mention_roles);
     assert_eq!(
         location,
         calendar_path(&format!("/rules/{}?msg=rule_created", rule.id))
@@ -1120,6 +1239,9 @@ async fn calendar_rule_create_validate_edit_delete() {
     let edit = with_field(&base, "name", Some("Renamed"));
     let edit = with_field(&edit, "kind", Some("reminder"));
     let edit = with_field(&edit, "mention_assignees", Some("on"));
+    let edit = with_field(&edit, "mention_roles", Some("on"));
+    let edit = with_field(&edit, "header_template", Some("  "));
+    let edit = with_field(&edit, "timezone", Some(" America/New_York "));
     let path = calendar_path(&format!("/rules/{}", rule.id));
     let res = post_owned(&app, &path, &cookie, &edit).await;
     assert_eq!(res.redirect(), format!("{path}?msg=saved"));
@@ -1129,7 +1251,32 @@ async fn calendar_rule_create_validate_edit_delete() {
         .unwrap();
     assert_eq!(saved.name, "Renamed");
     assert_eq!(saved.kind, Kind::Digest);
-    assert!(saved.mention_assignees);
+    assert!(saved.mention_assignees && saved.mention_roles);
+    assert_eq!(saved.header_template, "", "the header is optional");
+    assert_eq!(saved.timezone, "America/New_York");
+
+    // Role pings without a {roles} placeholder or a mapped tag are pointed out.
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(
+        page.body.contains("have no {roles} placeholder"),
+        "{}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("data-detect-tz"),
+        "existing rules keep their zone"
+    );
+    let edit = with_field(&edit, "item_template", Some("{title} {roles}"));
+    post_owned(&app, &path, &cookie, &edit).await;
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(page.body.contains("no ClickUp tag is mapped"));
+    set_tag_role(db, GUILD_ID, "meeting", Some(ROLE_ID), "root")
+        .await
+        .unwrap();
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(!page.body.contains("no ClickUp tag is mapped"));
+    let list = app.get(&calendar_path(""), Some(&cookie)).await;
+    assert!(list.body.contains("Mon, Fri at 08:30 America/New_York"));
     let bad = with_field(&base, "time", Some("noon"));
     let res = post_owned(&app, &path, &cookie, &bad).await;
     assert_eq!(res.redirect(), format!("{path}?msg=rule_time"));

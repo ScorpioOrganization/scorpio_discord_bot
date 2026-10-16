@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use async_trait::async_trait;
 use serenity::all::{
-    ChannelId, CreateAllowedMentions, CreateEmbed, CreateMessage, Http, Timestamp, UserId,
+    ChannelId, CreateAllowedMentions, CreateEmbed, CreateMessage, Http, RoleId, Timestamp, UserId,
 };
 
 use super::events::{self, Event, FetchError};
@@ -14,6 +14,7 @@ use super::schedule::{self, Digest, GRACE_SECS};
 use super::{
     ID, Kind, LogEntry, Rule, list_rules, load_config, log, mark_sent, set_last_run, was_sent,
 };
+use crate::bot::info;
 use crate::bot::members::guild_members;
 use crate::clickup::client::User;
 use crate::clickup::mapping::Resolver;
@@ -22,6 +23,8 @@ use crate::state::AppState;
 
 /// Upper bound per rule and tick, so a backlog cannot flood a channel at once.
 pub const MAX_REMINDERS_PER_TICK: usize = 10;
+/// Messages shown in a dashboard preview.
+const PREVIEW_MESSAGES: usize = 2;
 
 #[async_trait]
 pub trait Outbox: Send + Sync {
@@ -49,9 +52,10 @@ fn short(e: impl ToString) -> String {
 #[async_trait]
 impl Outbox for DiscordOutbox<'_> {
     async fn post(&self, channel_id: u64, msg: &OutMessage) -> Result<Option<String>, String> {
-        // Only the listed users may be pinged, never roles, @everyone or @here.
-        let mentions =
-            CreateAllowedMentions::new().users(msg.mention_users.iter().map(|id| UserId::new(*id)));
+        // Only the listed users and roles may be pinged, never @everyone or @here.
+        let mentions = CreateAllowedMentions::new()
+            .users(msg.mention_users.iter().map(|id| UserId::new(*id)))
+            .roles(msg.mention_roles.iter().map(|id| RoleId::new(*id)));
         let mut create = CreateMessage::new().allowed_mentions(mentions);
         if !msg.content.is_empty() {
             create = create.content(msg.content.clone());
@@ -175,11 +179,10 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
     if rules.is_empty() {
         return Ok(());
     }
-    let tz = cfg.tz();
 
     let mut due_digests = Vec::new();
     for rule in rules.iter().filter(|r| r.kind == Kind::Digest) {
-        let occurrence = schedule::latest_occurrence(now, rule.days, rule.time_of_day, &tz);
+        let occurrence = schedule::latest_occurrence(now, rule.days, rule.time_of_day, &rule.tz());
         match schedule::digest_decision(now, rule.last_run_at, occurrence) {
             Digest::Run(at) => due_digests.push((rule, at)),
             Digest::Skip(at) => {
@@ -224,9 +227,11 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
     };
     let upcoming = fetched.between(now, i64::MAX);
     let resolver = resolver_for(state, guild_id, &upcoming).await?;
+    let tag_roles = clickup::tag_roles(state, guild_id).await?;
     let list_name = cfg.list_name.clone().unwrap_or_default();
     let ctx = Ctx {
         resolver: &resolver,
+        tag_roles: &tag_roles,
         list_name: &list_name,
         now,
     };
@@ -306,9 +311,11 @@ pub async fn sample_messages(
         Err(e) => (vec![Event::sample(now)], Some(e)),
     };
     let resolver = resolver_for(state, guild_id, &upcoming).await?;
+    let tag_roles = clickup::tag_roles(state, guild_id).await?;
     let list_name = cfg.list_name.clone().unwrap_or_else(|| "Calendar".into());
     let ctx = Ctx {
         resolver: &resolver,
+        tag_roles: &tag_roles,
         list_name: &list_name,
         now,
     };
@@ -331,12 +338,7 @@ pub async fn sample_messages(
     Ok((msgs, error))
 }
 
-/// Readable text of the first message a rule would post, for the dashboard.
-pub async fn preview(state: &AppState, guild_id: u64, rule: &Rule, now: i64) -> Result<String> {
-    let (msgs, _) = sample_messages(state, guild_id, rule, now).await?;
-    let Some(msg) = msgs.first() else {
-        return Ok(String::new());
-    };
+fn message_text(msg: &OutMessage) -> String {
     let mut text = msg.content.clone();
     if let Some(e) = &msg.embed {
         for part in [e.title.as_deref(), Some(e.description.as_str())]
@@ -349,14 +351,37 @@ pub async fn preview(state: &AppState, guild_id: u64, rule: &Rule, now: i64) -> 
             text.push_str(part);
         }
     }
-    let cfg = load_config(&state.db, guild_id).await?;
+    text
+}
+
+/// Readable text of the first messages a rule would post, for the dashboard. Digest times
+/// are shown in the rule's time zone, reminder times in the server default.
+pub async fn preview(state: &AppState, guild_id: u64, rule: &Rule, now: i64) -> Result<String> {
+    let (msgs, _) = sample_messages(state, guild_id, rule, now).await?;
+    if msgs.is_empty() {
+        return Ok(String::new());
+    }
+    let shown = msgs.len().min(PREVIEW_MESSAGES);
+    let text = msgs[..shown]
+        .iter()
+        .map(message_text)
+        .collect::<Vec<_>>()
+        .join("\n\n--- next message ---\n\n");
+    let tz = match rule.kind {
+        Kind::Digest => rule.tz(),
+        Kind::Reminder => load_config(&state.db, guild_id).await?.tz(),
+    };
     let members = guild_members(state, guild_id).await;
-    let more = if msgs.len() > 1 {
-        format!("\n\n(and {} more messages)", msgs.len() - 1)
+    let roles = state
+        .discord()
+        .map(|d| info::roles(&d.cache, guild_id))
+        .unwrap_or_default();
+    let more = if msgs.len() > shown {
+        format!("\n\n(and {} more messages)", msgs.len() - shown)
     } else {
         String::new()
     };
-    Ok(render::humanize(&text, &cfg.tz(), &members, now) + &more)
+    Ok(render::humanize(&text, &tz, &members, &roles, now) + &more)
 }
 
 #[derive(Debug, PartialEq)]
@@ -382,6 +407,7 @@ pub async fn send_test(
     // Tests never ping anyone; mentions still render as names.
     for msg in &mut msgs {
         msg.mention_users.clear();
+        msg.mention_roles.clear();
     }
     let out = post_all(outbox, rule.channel_id.unwrap_or_default(), &msgs).await;
     let ok = out.failed == 0;
@@ -405,9 +431,10 @@ pub mod tests {
     use crate::modules::calendar::{
         CalendarConfig, Layout, insert_rule, load_rule, reactions, recent_log, save_config,
     };
+    use crate::modules::clickup::set_tag_role;
     use crate::modules::{counter, set_enabled};
     use crate::secrets::SecretString;
-    use crate::test_util::{self, CHANNEL_ID, GUILD_ID, MEMBER_ID};
+    use crate::test_util::{self, CHANNEL_ID, GUILD_ID, MEMBER_ID, ROLE_ID};
 
     /// Remembers posts instead of sending them. Fails every post while `fail` is set.
     #[derive(Default)]
@@ -574,6 +601,61 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn digests_follow_the_rule_time_zone() {
+        let s = setup().await;
+        s.mock
+            .set_tasks(mock::LIST_ID, vec![task_at("a", "Standup", NINE + 1800)]);
+        // 09:00 in Warsaw is 07:00 UTC in October (CEST).
+        let mut rule = digest();
+        rule.timezone = "Europe/Warsaw".into();
+        add_rule(&s, &rule).await;
+
+        run(&s.state, GUILD_ID, NINE - 7200 - 60, &s.outbox)
+            .await
+            .unwrap();
+        assert!(s.outbox.take().is_empty(), "before 09:00 Warsaw");
+        run(&s.state, GUILD_ID, NINE - 7200 + 30, &s.outbox)
+            .await
+            .unwrap();
+        assert_eq!(s.outbox.take().len(), 1);
+        run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
+        assert!(s.outbox.take().is_empty(), "09:00 UTC is not the schedule");
+    }
+
+    #[tokio::test]
+    async fn roles_from_tags_are_pinged_only_when_enabled() {
+        let s = setup().await;
+        let mut task = task_at("a", "Standup", NINE + 600);
+        task["tags"] = json!([{"name": "Meeting"}, {"name": "unmapped"}]);
+        s.mock.set_tasks(mock::LIST_ID, vec![task]);
+        set_tag_role(&s.state.db, GUILD_ID, "meeting", Some(ROLE_ID), "root")
+            .await
+            .unwrap();
+        let mut rule = reminder();
+        rule.item_template = "{title} {roles}".into();
+        rule.mention_roles = true;
+        let rule = add_rule(&s, &rule).await;
+
+        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        let posts = s.outbox.take();
+        assert_eq!(posts.len(), 1);
+        let msg = &posts[0].1;
+        assert_eq!(msg.content, format!("Standup <@&{ROLE_ID}>"));
+        assert_eq!(msg.mention_roles, [ROLE_ID]);
+        assert!(msg.mention_users.is_empty());
+
+        // Test messages never ping, the preview shows role names.
+        send_test(&s.state, GUILD_ID, &rule, &s.outbox, NINE)
+            .await
+            .unwrap();
+        let posts = s.outbox.take();
+        assert!(posts[0].1.mention_roles.is_empty());
+        assert!(posts[0].1.content.contains(&format!("<@&{ROLE_ID}>")));
+        let text = preview(&s.state, GUILD_ID, &rule, NINE).await.unwrap();
+        assert_eq!(text, "Standup @Team");
+    }
+
+    #[tokio::test]
     async fn late_digests_are_skipped_and_logged() {
         let s = setup().await;
         let mut rule = digest();
@@ -620,8 +702,17 @@ pub mod tests {
 
         run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
         let posts = s.outbox.take();
-        assert_eq!(posts.len(), 2);
-        assert!(posts.iter().all(|(_, m)| m.mention_users == [MEMBER_ID]));
+        assert_eq!(posts.len(), 3, "the header, then one message per event");
+        let header = &posts[0].1;
+        assert_eq!(header.content, "**Upcoming events** (2)");
+        assert!(header.reactions.is_empty());
+        assert!(posts[1].1.content.starts_with("Standup"));
+        assert!(
+            posts[1..]
+                .iter()
+                .all(|(_, m)| m.mention_users == [MEMBER_ID])
+        );
+        assert!(posts[1..].iter().all(|(_, m)| m.reactions.len() == 2));
 
         // 23:00, nothing within the next hour: the empty message is posted.
         run(&s.state, GUILD_ID, NINE + 14 * 3600, &s.outbox)

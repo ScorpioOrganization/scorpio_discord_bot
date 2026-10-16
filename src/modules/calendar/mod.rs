@@ -246,8 +246,10 @@ pub struct Rule {
     pub channel_id: Option<u64>,
     /// Weekdays, bit 0 = Monday.
     pub days: u8,
-    /// Minutes after local midnight.
+    /// Minutes after midnight in `timezone`.
     pub time_of_day: u16,
+    /// IANA time zone of the digest schedule.
+    pub timezone: String,
     pub lookahead_hours: u32,
     pub lead_minutes: u32,
     pub layout: Layout,
@@ -257,6 +259,8 @@ pub struct Rule {
     pub item_template: String,
     pub empty_template: String,
     pub mention_assignees: bool,
+    /// Ping roles mapped from task tags (the `{roles}` placeholder).
+    pub mention_roles: bool,
     pub use_embed: bool,
     pub embed_color: u32,
     pub description_max: u32,
@@ -278,6 +282,7 @@ impl Rule {
             channel_id: None,
             days: schedule::ALL_DAYS,
             time_of_day: 9 * 60,
+            timezone: "UTC".into(),
             lookahead_hours: 24,
             lead_minutes: 15,
             layout: Layout::Combined,
@@ -287,12 +292,18 @@ impl Rule {
             item_template: item.into(),
             empty_template: DEFAULT_EMPTY.into(),
             mention_assignees: false,
+            mention_roles: false,
             use_embed: false,
             embed_color: DEFAULT_COLOR,
             description_max: 200,
             reactions: Vec::new(),
             last_run_at: None,
         }
+    }
+
+    /// The digest schedule's time zone, UTC if the stored name is unknown.
+    pub fn tz(&self) -> TimeZone {
+        schedule::parse_tz(&self.timezone).unwrap_or(TimeZone::UTC)
     }
 
     /// How far ahead this rule needs events, in seconds.
@@ -307,9 +318,10 @@ impl Rule {
     pub fn schedule_text(&self) -> String {
         match self.kind {
             Kind::Digest => format!(
-                "{} at {}, events of the next {} h",
+                "{} at {} {}, events of the next {} h",
                 schedule::describe_days(self.days),
                 schedule::fmt_minute(self.time_of_day),
+                self.timezone,
                 self.lookahead_hours
             ),
             Kind::Reminder => format!(
@@ -329,6 +341,7 @@ struct RuleRow {
     channel_id: Option<i64>,
     days: i64,
     time_of_day: i64,
+    timezone: String,
     lookahead_hours: i64,
     lead_minutes: i64,
     layout: String,
@@ -338,6 +351,7 @@ struct RuleRow {
     item_template: String,
     empty_template: String,
     mention_assignees: bool,
+    mention_roles: bool,
     use_embed: bool,
     embed_color: i64,
     description_max: i64,
@@ -355,6 +369,7 @@ impl From<RuleRow> for Rule {
             channel_id: r.channel_id.map(|c| c as u64),
             days: (r.days & i64::from(schedule::ALL_DAYS)) as u8,
             time_of_day: r.time_of_day.clamp(0, 1439) as u16,
+            timezone: r.timezone,
             lookahead_hours: r.lookahead_hours.clamp(1, 336) as u32,
             lead_minutes: r.lead_minutes.clamp(1, 10080) as u32,
             layout: if r.layout == "per_event" {
@@ -368,6 +383,7 @@ impl From<RuleRow> for Rule {
             item_template: r.item_template,
             empty_template: r.empty_template,
             mention_assignees: r.mention_assignees,
+            mention_roles: r.mention_roles,
             use_embed: r.use_embed,
             embed_color: (r.embed_color & 0xff_ffff) as u32,
             description_max: r.description_max.clamp(0, 1000) as u32,
@@ -377,10 +393,10 @@ impl From<RuleRow> for Rule {
     }
 }
 
-const RULE_COLUMNS: &str = "id, name, enabled, kind, channel_id, days, time_of_day, \
+const RULE_COLUMNS: &str = "id, name, enabled, kind, channel_id, days, time_of_day, timezone, \
     lookahead_hours, lead_minutes, layout, max_events, post_when_empty, header_template, \
-    item_template, empty_template, mention_assignees, use_embed, embed_color, description_max, \
-    reactions, last_run_at";
+    item_template, empty_template, mention_assignees, mention_roles, use_embed, embed_color, \
+    description_max, reactions, last_run_at";
 
 pub async fn list_rules(db: &SqlitePool, guild_id: u64) -> Result<Vec<Rule>> {
     let rows: Vec<RuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -419,11 +435,12 @@ pub async fn count_rules(db: &SqlitePool, guild_id: u64) -> Result<i64> {
 pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) -> Result<i64> {
     let res = sqlx::query(
         "INSERT INTO calendar_rules
-             (guild_id, name, enabled, kind, channel_id, days, time_of_day, lookahead_hours,
-              lead_minutes, layout, max_events, post_when_empty, header_template, item_template,
-              empty_template, mention_assignees, use_embed, embed_color, description_max,
-              reactions, last_run_at, created_at, updated_at, updated_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (guild_id, name, enabled, kind, channel_id, days, time_of_day, timezone,
+              lookahead_hours, lead_minutes, layout, max_events, post_when_empty,
+              header_template, item_template, empty_template, mention_assignees, mention_roles,
+              use_embed, embed_color, description_max, reactions, last_run_at, created_at,
+              updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(sf(guild_id))
     .bind(rule.name.clone())
@@ -432,6 +449,7 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(rule.channel_id.map(sf))
     .bind(i64::from(rule.days))
     .bind(i64::from(rule.time_of_day))
+    .bind(rule.timezone.clone())
     .bind(i64::from(rule.lookahead_hours))
     .bind(i64::from(rule.lead_minutes))
     .bind(layout_str(rule.layout))
@@ -441,6 +459,7 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(rule.item_template.clone())
     .bind(rule.empty_template.clone())
     .bind(rule.mention_assignees)
+    .bind(rule.mention_roles)
     .bind(rule.use_embed)
     .bind(i64::from(rule.embed_color))
     .bind(i64::from(rule.description_max))
@@ -459,11 +478,12 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
 pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) -> Result<()> {
     sqlx::query(
         "UPDATE calendar_rules SET
-             name = ?, enabled = ?, channel_id = ?, days = ?, time_of_day = ?,
+             name = ?, enabled = ?, channel_id = ?, days = ?, time_of_day = ?, timezone = ?,
              lookahead_hours = ?, lead_minutes = ?, layout = ?, max_events = ?,
              post_when_empty = ?, header_template = ?, item_template = ?, empty_template = ?,
-             mention_assignees = ?, use_embed = ?, embed_color = ?, description_max = ?,
-             reactions = ?, last_run_at = ?, updated_at = ?, updated_by = ?
+             mention_assignees = ?, mention_roles = ?, use_embed = ?, embed_color = ?,
+             description_max = ?, reactions = ?, last_run_at = ?, updated_at = ?,
+             updated_by = ?
          WHERE guild_id = ? AND id = ?",
     )
     .bind(rule.name.clone())
@@ -471,6 +491,7 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(rule.channel_id.map(sf))
     .bind(i64::from(rule.days))
     .bind(i64::from(rule.time_of_day))
+    .bind(rule.timezone.clone())
     .bind(i64::from(rule.lookahead_hours))
     .bind(i64::from(rule.lead_minutes))
     .bind(layout_str(rule.layout))
@@ -480,6 +501,7 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(rule.item_template.clone())
     .bind(rule.empty_template.clone())
     .bind(rule.mention_assignees)
+    .bind(rule.mention_roles)
     .bind(rule.use_embed)
     .bind(i64::from(rule.embed_color))
     .bind(i64::from(rule.description_max))
@@ -676,9 +698,14 @@ mod tests {
         assert!(load_rule(&db, 1, other).await.unwrap().is_none());
         assert_eq!(count_rules(&db, 1).await.unwrap(), 1);
 
+        assert_eq!(loaded.timezone, "UTC");
+        assert!(!loaded.mention_roles);
+
         let mut edited = loaded.clone();
         edited.name = "Standup ping".into();
         edited.lead_minutes = 60;
+        edited.timezone = "Europe/Warsaw".into();
+        edited.mention_roles = true;
         update_rule(&db, 1, &edited, "alice").await.unwrap();
         // Editing through the wrong guild changes nothing.
         edited.name = "hijacked".into();
@@ -686,6 +713,8 @@ mod tests {
         let loaded = load_rule(&db, 1, id).await.unwrap().unwrap();
         assert_eq!(loaded.name, "Standup ping");
         assert_eq!(loaded.lead_minutes, 60);
+        assert_eq!(loaded.tz().iana_name(), Some("Europe/Warsaw"));
+        assert!(loaded.mention_roles);
 
         mark_sent(&db, id, "t1", 100).await.unwrap();
         mark_sent(&db, id, "t1", 100).await.unwrap();

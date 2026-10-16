@@ -155,6 +155,10 @@ async fn handle(
             "id": FOLDER_ID, "name": "Team",
             "lists": [{"id": LIST_ID, "name": "Calendar"}]
         }]}),
+        ["space", SPACE_ID, "tag"] => json!({"tags": [
+            {"name": "meeting", "tag_fg": "#fff", "tag_bg": "#000"},
+            {"name": "Team Sync", "tag_fg": "#fff", "tag_bg": "#000"}
+        ]}),
         ["space", SPACE_ID, "list"] => json!({"lists": [{"id": OTHER_LIST_ID, "name": "Misc"}]}),
         ["list", LIST_ID] => json!({
             "id": LIST_ID, "name": "Calendar",

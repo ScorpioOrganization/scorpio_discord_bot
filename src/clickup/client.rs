@@ -161,6 +161,22 @@ impl ClickUpClient {
         Ok(w.lists)
     }
 
+    /// Tags defined in a space.
+    pub async fn space_tags(
+        &self,
+        token: &SecretString,
+        space_id: &str,
+    ) -> Result<Vec<Tag>, ClickUpError> {
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default, deserialize_with = "null_default")]
+            tags: Vec<Tag>,
+        }
+        let path = format!("/space/{}/tag", seg(space_id));
+        let w: Wrap = self.get(token, &path, &[]).await?;
+        Ok(w.tags)
+    }
+
     pub async fn list(&self, token: &SecretString, list_id: &str) -> Result<List, ClickUpError> {
         self.get(token, &format!("/list/{}", seg(list_id)), &[])
             .await
@@ -457,6 +473,9 @@ mod tests {
         assert_eq!(folders[0].lists[0].id, mock::LIST_ID);
         let lists = client.folderless_lists(&t, mock::SPACE_ID).await.unwrap();
         assert_eq!(lists[0].id, mock::OTHER_LIST_ID);
+        let tags = client.space_tags(&t, mock::SPACE_ID).await.unwrap();
+        let names: Vec<&str> = tags.iter().map(Tag::name).collect();
+        assert_eq!(names, ["meeting", "Team Sync"]);
         let list = client.list(&t, mock::LIST_ID).await.unwrap();
         assert_eq!(list.name, "Calendar");
         assert_eq!(list.folder.unwrap().name, "Team");

@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use askama::Template;
 use axum::extract::{Path, Query, State};
@@ -9,10 +11,11 @@ use serde::Deserialize;
 use serenity::all::GatewayIntents;
 
 use super::{
-    ID, MAX_MAPPINGS, explicit_mappings, load_config, mapping_rows, save_workspace, set_mapping,
+    ID, MAX_MAPPINGS, MAX_TAG_ROLES, explicit_mappings, load_config, mapping_rows, normalize_tag,
+    save_workspace, set_mapping, set_tag_role, tag_role_rows,
 };
 use crate::auth::extract::CurrentUser;
-use crate::bot::info::GuildSummary;
+use crate::bot::info::{self, GuildSummary, RoleOption};
 use crate::bot::members::{MemberInfo, guild_members};
 use crate::clickup::ClickUpError;
 use crate::clickup::client::{Team, User};
@@ -34,14 +37,28 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/guilds/{gid}/modules/clickup/mapping", post(save_mapping))
         .route(
+            "/guilds/{gid}/modules/clickup/tag-roles",
+            post(save_tag_roles),
+        )
+        .route(
             "/guilds/{gid}/modules/clickup/members/refresh",
             post(refresh_members),
         )
         .merge(token_routes(ID))
 }
 
+const TAGS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+const TAGS_MAX_SPACES: usize = 20;
+
 fn base_path(gid: u64) -> String {
     format!("/guilds/{gid}/modules/{ID}")
+}
+
+fn guild_roles(state: &AppState, gid: u64) -> Vec<RoleOption> {
+    state
+        .discord()
+        .map(|d| info::roles(&d.cache, gid))
+        .unwrap_or_default()
 }
 
 struct TeamOption {
@@ -66,6 +83,14 @@ struct MemberOption {
     label: String,
 }
 
+struct TagRow {
+    tag: String,
+    /// The mapped role, 0 for none.
+    role_id: u64,
+    /// Mapped to a role that no longer exists; saving the form removes the mapping.
+    deleted: bool,
+}
+
 #[derive(Template)]
 #[template(path = "modules/clickup.html")]
 struct ClickUpPage {
@@ -81,6 +106,9 @@ struct ClickUpPage {
     people: Vec<PersonRow>,
     member_options: Vec<MemberOption>,
     member_count: usize,
+    tag_rows: Vec<TagRow>,
+    tag_error: Option<String>,
+    roles: Vec<RoleOption>,
     api_ok: i64,
     api_err: i64,
 }
@@ -100,6 +128,36 @@ async fn fetch_teams(
 ) -> Result<Vec<Team>, ClickUpError> {
     let result = state.clickup.teams(&cred.token).await;
     tokens::track(&state.db, gid, ID, cred, result).await
+}
+
+/// Tag names (normalized) of every space in a workspace, sorted.
+async fn workspace_tags(
+    state: &AppState,
+    gid: u64,
+    cred: &Credential,
+    team_id: &str,
+) -> Result<Arc<Vec<String>>, ClickUpError> {
+    // Keyed by the key itself, so a replaced key never shows the old account's tags.
+    let fingerprint = &crate::auth::hash_token(cred.token.expose())[..16];
+    let key = format!("clickup:tags:{gid}:{team_id}:{fingerprint}");
+    if let Some(hit) = state.cache.get::<Vec<String>>(&key, TAGS_MAX_AGE) {
+        return Ok(hit);
+    }
+    let (db, client, token) = (&state.db, &state.clickup, &cred.token);
+    let spaces = tokens::track(db, gid, ID, cred, client.spaces(token, team_id).await).await?;
+    let mut names = HashSet::new();
+    for space in spaces.iter().take(TAGS_MAX_SPACES) {
+        let tags =
+            tokens::track(db, gid, ID, cred, client.space_tags(token, &space.id).await).await?;
+        names.extend(tags.iter().filter_map(|t| normalize_tag(t.name())));
+    }
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    Ok(state.cache.insert(key, names))
+}
+
+fn invalidate_tags(state: &AppState, gid: u64) {
+    state.cache.remove_prefix(&format!("clickup:tags:{gid}:"));
 }
 
 async fn page(
@@ -159,6 +217,17 @@ async fn page(
     let members = guild_members(&state, gid).await;
     let people = person_rows(&state, gid, workspace_people, &members).await?;
 
+    let roles = guild_roles(&state, gid);
+    let mut tag_error = None;
+    let mut known_tags = Vec::new();
+    if let (Ok(cred), Some(team)) = (&cred, selected) {
+        match workspace_tags(&state, gid, cred, &team.id).await {
+            Ok(tags) => known_tags = tags.to_vec(),
+            Err(e) => tag_error = Some(e.to_string()),
+        }
+    }
+    let tag_rows = tag_rows(&state, gid, known_tags, &roles).await?;
+
     let page = ClickUpPage {
         page: PageCtx::new(&user, "guilds", &msg),
         guild,
@@ -184,11 +253,44 @@ async fn page(
             })
             .collect(),
         member_count: members.len(),
+        tag_rows,
+        tag_error,
+        roles,
         token,
         api_ok: counter(&state.db, Some(gid), ID, "api_ok").await?,
         api_err: counter(&state.db, Some(gid), ID, "api_err").await?,
     };
     Ok(Html(page.render()?))
+}
+
+/// Workspace tags plus every mapped tag, sorted.
+async fn tag_rows(
+    state: &AppState,
+    gid: u64,
+    known: Vec<String>,
+    roles: &[RoleOption],
+) -> AppResult<Vec<TagRow>> {
+    let mapped: HashMap<String, u64> = tag_role_rows(&state.db, gid)
+        .await?
+        .into_iter()
+        .map(|r| (r.tag, r.role_id as u64))
+        .collect();
+    let mut tags: Vec<String> = known;
+    tags.extend(mapped.keys().cloned());
+    tags.sort();
+    tags.dedup();
+    Ok(tags
+        .into_iter()
+        .map(|tag| {
+            let role_id = mapped.get(&tag).copied().unwrap_or_default();
+            let deleted = role_id != 0 && !roles.iter().any(|r| r.id == role_id);
+            TagRow {
+                tag,
+                role_id: if deleted { 0 } else { role_id },
+                deleted,
+            }
+        })
+        .collect())
 }
 
 /// Workspace members plus anyone with a saved mapping, with their current match.
@@ -312,6 +414,7 @@ async fn choose_workspace(
         return Ok(redirect_msg(&back, "workspace_invalid"));
     };
     save_workspace(&state.db, gid, Some((&team.id, &team.name)), &user.username).await?;
+    invalidate_tags(&state, gid);
     tracing::info!(user = %user.username, guild_id = gid, team = %team.id, "ClickUp workspace selected");
     Ok(redirect_msg(&back, "workspace_saved"))
 }
@@ -415,7 +518,83 @@ async fn refresh_members(
 ) -> AppResult<Response> {
     require_guild(&state, gid)?;
     state.members.invalidate(gid);
+    invalidate_tags(&state, gid);
     Ok(redirect_msg(&base_path(gid), "members_refreshed"))
+}
+
+/// Saves the tag to role table plus the "other tag" row. An empty role removes a mapping.
+/// If any row is invalid, nothing is saved.
+async fn save_tag_roles(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(gid): Path<u64>,
+    Form(fields): Form<Vec<(String, String)>>,
+) -> AppResult<Response> {
+    require_guild(&state, gid)?;
+    let back = base_path(gid);
+    let get = |key: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default()
+    };
+    let mut inputs: Vec<(&str, &str)> = fields
+        .iter()
+        .filter_map(|(k, v)| {
+            let i = k.strip_prefix("tag_")?;
+            Some((v.as_str(), get(&format!("role_{i}"))))
+        })
+        .collect();
+    if !get("new_tag").trim().is_empty() {
+        inputs.push((get("new_tag"), get("new_role")));
+    }
+    if inputs.len() > MAX_MAPPINGS {
+        return Err(AppError::BadRequest);
+    }
+
+    let known: HashSet<u64> = guild_roles(&state, gid).iter().map(|r| r.id).collect();
+    let mut wanted: HashMap<String, Option<u64>> = HashMap::new();
+    for (tag_raw, role_raw) in inputs {
+        let Some(tag) = normalize_tag(tag_raw) else {
+            return Ok(redirect_msg(&back, "tag_invalid"));
+        };
+        let role = match role_raw.trim() {
+            "" => None,
+            raw => match raw.parse::<u64>() {
+                Ok(id) if known.contains(&id) => Some(id),
+                _ => return Ok(redirect_msg(&back, "role_unknown")),
+            },
+        };
+        wanted.insert(tag, role);
+    }
+
+    let current: HashMap<String, u64> = tag_role_rows(&state.db, gid)
+        .await?
+        .into_iter()
+        .map(|r| (r.tag, r.role_id as u64))
+        .collect();
+    let changes: Vec<(String, Option<u64>)> = wanted
+        .into_iter()
+        .filter(|(tag, role)| current.get(tag).copied() != *role)
+        .collect();
+    let after = current.len() as i64
+        + changes
+            .iter()
+            .map(|(tag, role)| match (current.contains_key(tag), role) {
+                (false, Some(_)) => 1,
+                (true, None) => -1,
+                _ => 0,
+            })
+            .sum::<i64>();
+    if after > MAX_TAG_ROLES {
+        return Ok(redirect_msg(&back, "too_many_tag_roles"));
+    }
+    for (tag, role) in &changes {
+        set_tag_role(&state.db, gid, tag, *role, &user.username).await?;
+    }
+    tracing::info!(user = %user.username, guild_id = gid, changed = changes.len(), "ClickUp tag roles saved");
+    Ok(redirect_msg(&back, "tag_roles_saved"))
 }
 
 #[cfg(test)]

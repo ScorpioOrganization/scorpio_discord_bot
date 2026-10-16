@@ -31,7 +31,16 @@ pub struct ChannelOption {
     pub can_embed: bool,
     /// Adding reactions also needs the message history permission.
     pub can_react: bool,
+    /// Needed to ping roles that are not mentionable.
+    pub can_mention_all: bool,
     pub selected: bool,
+}
+
+pub struct RoleOption {
+    pub id: u64,
+    pub name: String,
+    /// Anyone may ping it; otherwise the bot needs the Mention All Roles permission.
+    pub mentionable: bool,
 }
 
 pub struct BotStatus {
@@ -95,6 +104,7 @@ pub fn text_channels(cache: &Cache, guild_id: u64) -> Vec<ChannelOption> {
                     can_send: has(Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES),
                     can_embed: has(Permissions::EMBED_LINKS),
                     can_react: has(Permissions::ADD_REACTIONS | Permissions::READ_MESSAGE_HISTORY),
+                    can_mention_all: has(Permissions::MENTION_EVERYONE),
                     selected: false,
                 },
             )
@@ -102,6 +112,33 @@ pub fn text_channels(cache: &Cache, guild_id: u64) -> Vec<ChannelOption> {
         .collect();
     channels.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
     channels.into_iter().map(|(_, c)| c).collect()
+}
+
+/// Roles of a guild, highest first, without `@everyone`.
+pub fn roles(cache: &Cache, guild_id: u64) -> Vec<RoleOption> {
+    if guild_id == 0 {
+        return Vec::new();
+    }
+    let Some(g) = cache.guild(GuildId::new(guild_id)) else {
+        return Vec::new();
+    };
+    let mut roles: Vec<_> = g
+        .roles
+        .values()
+        .filter(|r| r.id.get() != guild_id)
+        .map(|r| {
+            (
+                r.position,
+                RoleOption {
+                    id: r.id.get(),
+                    name: r.name.clone(),
+                    mentionable: r.mentionable,
+                },
+            )
+        })
+        .collect();
+    roles.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    roles.into_iter().map(|(_, r)| r).collect()
 }
 
 pub async fn status(state: &AppState) -> BotStatus {

@@ -46,6 +46,39 @@
     });
   });
 
+  // Time zone fields: offer the browser's zone, and prefill it where data-detect-tz is set
+  // (new digest rules). Only zones in the field's list are used, the server knows those.
+  var localTz = "";
+  try {
+    localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch (e) {
+    localTz = "";
+  }
+  function knowsLocalTz(input) {
+    if (!localTz || !input.list) return false;
+    return Array.prototype.some.call(input.list.options, function (o) {
+      return o.value === localTz;
+    });
+  }
+  document.querySelectorAll("input[data-detect-tz]").forEach(function (input) {
+    if (knowsLocalTz(input)) input.value = localTz;
+  });
+  document.querySelectorAll("[data-local-tz]").forEach(function (btn) {
+    var target = document.getElementById(btn.dataset.localTz);
+    if (!target || !knowsLocalTz(target)) return;
+    btn.textContent = "Use my time zone (" + localTz + ")";
+    function sync() {
+      btn.hidden = target.value.trim() === localTz;
+    }
+    btn.addEventListener("click", function () {
+      target.value = localTz;
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.focus();
+    });
+    target.addEventListener("input", sync);
+    sync();
+  });
+
   initGreetingEditor();
 
   function initGreetingEditor() {

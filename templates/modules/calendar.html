@@ -70,12 +70,16 @@
       </label>
       <p class="hint">ClickUp cannot filter by start date, so start date mode reads every open task in the list. On a big list, use a tag filter.</p>
       <label>
-        <span>Time zone for digest schedules</span>
-        <input type="text" name="timezone" value="{{ cfg.timezone }}" list="time-zones" required autocomplete="off">
+        <span>Default time zone (new digest rules, times on this page)</span>
+        <input type="text" name="timezone" id="source-tz" value="{{ cfg.timezone }}" list="time-zones" required autocomplete="off">
       </label>
       <datalist id="time-zones">
         {% for name in tz_names %}<option value="{{ name }}">{% endfor %}
       </datalist>
+      <div class="chips">
+        <button type="button" class="chip" data-local-tz="source-tz" hidden>Use my time zone</button>
+      </div>
+      <p class="hint">Each digest rule keeps its own time zone, set in the rule.</p>
       <label>
         <span>Only tasks with one of these tags (comma separated, optional)</span>
         <input type="text" name="tag_filter" value="{{ cfg.tag_filter }}" placeholder="meeting, event" autocomplete="off">

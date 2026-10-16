@@ -54,9 +54,19 @@
       </div>
     </fieldset>
     <label class="inline-field">
-      <span>Time ({{ timezone }})</span>
+      <span>Time</span>
       <input type="time" name="time" value="{{ time }}" required>
     </label>
+    <label>
+      <span>Time zone of this schedule</span>
+      <input type="text" name="timezone" id="rule-tz" value="{{ rule.timezone }}" list="time-zones" required autocomplete="off"{% if is_new %} data-detect-tz{% endif %}>
+    </label>
+    <datalist id="time-zones">
+      {% for name in tz_names %}<option value="{{ name }}">{% endfor %}
+    </datalist>
+    <div class="chips">
+      <button type="button" class="chip" data-local-tz="rule-tz" hidden>Use my time zone</button>
+    </div>
     <label class="inline-field">
       <span>Include events of the next (hours)</span>
       <input type="number" name="lookahead_hours" value="{{ rule.lookahead_hours }}" min="1" max="336" required>
@@ -73,8 +83,8 @@
       <input type="number" name="max_events" value="{{ rule.max_events }}" min="1" max="50" required>
     </label>
     <label>
-      <span>Header (one message layout)</span>
-      <textarea name="header_template" id="header-tpl" rows="2" maxlength="{{ max_len }}" required>{{ rule.header_template }}</textarea>
+      <span>Header (optional; its own first message in the one message per event layout)</span>
+      <textarea name="header_template" id="header-tpl" rows="2" maxlength="{{ max_len }}">{{ rule.header_template }}</textarea>
     </label>
     <div class="chips" aria-label="Insert header placeholder">
       {% for (token, _desc) in header_placeholders %}
@@ -112,6 +122,10 @@
     <label class="check">
       <input type="checkbox" name="mention_assignees"{% if rule.mention_assignees %} checked{% endif %}>
       <span>Ping assignees that are matched to server members</span>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="mention_roles"{% if rule.mention_roles %} checked{% endif %}>
+      <span>Ping roles mapped from task tags (<code>{roles}</code>, mapped on the ClickUp page)</span>
     </label>
     <label class="check">
       <input type="checkbox" name="use_embed"{% if rule.use_embed %} checked{% endif %}>
@@ -171,7 +185,7 @@
       {% if is_digest %}
       <p class="hint">In the header and the empty message: {% for (token, desc) in header_placeholders %}<code>{{ token }}</code> {{ desc|lower }}{% if !loop.last %}, {% endif %}{% endfor %}.</p>
       {% endif %}
-      <p class="hint">Lines whose placeholders are all empty are left out. <code>@everyone</code> and role mentions never ping.</p>
+      <p class="hint">Lines whose placeholders are all empty are left out. <code>@everyone</code> never pings. Roles ping only through <code>{roles}</code>, when the rule allows it.</p>
     </section>
 
     {% if !is_new %}

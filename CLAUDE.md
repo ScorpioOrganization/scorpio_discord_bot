@@ -67,7 +67,7 @@ Every bot feature is a `Module` (`src/modules/mod.rs`) registered in `modules::r
 - Event dispatch is explicit: `Handler` in `src/bot/mod.rs` currently only routes `guild_member_addition` to `Module::on_member_join`, checking `is_enabled` per module. A new event type needs a default method on the trait plus a matching dispatch loop in `Handler`.
 - Periodic work: a module returns `true` from `ticks()` and implements `on_tick(state, discord, guild_id)`. `bot::scheduler` runs it about once a minute for every guild the module is enabled in and the bot is in, concurrently with a 50 s timeout; errors are logged. Keep ticks cheap when there is nothing to do (no remote calls). `calendar` is the reference (`runner::run` takes a `now` and an `Outbox` so it is testable).
 - Log pruning is not part of the trait: `maintenance` in `main.rs` calls `greeting::prune_log` and `calendar::prune` directly, so a new module with a log table needs its own call there.
-- Messages sent to Discord must restrict pings with `CreateAllowedMentions` (see `greeting::send`, `calendar::runner::DiscordOutbox`) so templates or user names cannot ping `@everyone` or roles.
+- Messages sent to Discord must restrict pings with `CreateAllowedMentions` (see `greeting::send`, `calendar::runner::DiscordOutbox`) so templates or user names cannot ping `@everyone` or roles. Roles may only be allowed when they come from the tag mapping and the rule enables it (`OutMessage::mention_roles`).
 - User configurable templates use `modules::text` (`render` with a closure, `escape_markdown`, `truncate_chars`, `parse_hex_color`).
 
 ### ClickUp integration
@@ -78,6 +78,7 @@ Shared layer in `src/clickup`, used by the `clickup` module (the shared key, wor
 - `tokens.rs`: per guild keys in `clickup_tokens`, sealed by `secrets::Vault` with the row (`clickup:{guild}:{owner}`) as authenticated data. `owner` is `clickup` (shared key) or a module id (own key); `clickup_token_source` says which one a module uses (shared by default, and only while the ClickUp module is enabled). Use `resolve(state, guild, module_id)` to get a key and wrap every API call in `track(..)`, which records last success / error and `api_ok` / `api_err` counters. Keys are write-only: never render, log or return them.
 - `web.rs`: `token_routes(owner)` + `token_view` + `templates/clickup/token_card.html` give a module the key card (save after a `GET /user` check, remove, shared or own).
 - `mapping.rs`: pure name matching (`Resolver`); `modules::clickup::resolver(state, guild, people)` combines it with the explicit mappings and the guild member list.
+- Tag to role mappings live in `clickup_tag_roles` (tags lowercase, `modules::clickup::normalize_tag`); `modules::clickup::tag_roles(state, guild)` returns them without roles deleted in Discord. They back the `{roles}` placeholder.
 - `secrets.rs`: the key comes from `SECRETS_KEY` or a generated `secret.key` next to the database (ephemeral for `:memory:`). Losing it only means keys must be re-entered.
 
 ### Tests

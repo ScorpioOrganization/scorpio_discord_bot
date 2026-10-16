@@ -113,4 +113,53 @@
   </form>
   {% endif %}
 </section>
+
+<section class="card">
+  <h2>Tags to roles</h2>
+  <p class="hint">A task with a mapped tag mentions that role through the <code>{roles}</code> placeholder, for example in Calendar messages. Tags are matched ignoring case. A role is only pinged when the message's rule allows it, and the role must be mentionable or the bot needs the Mention All Roles permission in the channel.</p>
+  {% if let Some(err) = tag_error %}
+  <div class="callout callout-err small">Could not load the workspace's tags: {{ err }}</div>
+  {% endif %}
+  {% if roles.is_empty() %}
+  <p class="muted">This server has no roles to map yet.</p>
+  {% else %}
+  <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/tag-roles">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <div class="table-wrap">
+      <table class="table mapping-table">
+        <thead><tr><th>ClickUp tag</th><th>Discord role</th></tr></thead>
+        <tbody>
+        {% for t in tag_rows %}
+        <tr>
+          <td>{{ t.tag }}{% if t.deleted %}<br><span class="badge badge-warn">mapped role was deleted</span>{% endif %}</td>
+          <td>
+            <input type="hidden" name="tag_{{ loop.index0 }}" value="{{ t.tag }}">
+            <select name="role_{{ loop.index0 }}" aria-label="Discord role for {{ t.tag }}">
+              <option value="">None</option>
+              {% for r in roles %}
+              <option value="{{ r.id }}"{% if r.id == t.role_id %} selected{% endif %}>@{{ r.name }}{% if !r.mentionable %} (not mentionable){% endif %}</option>
+              {% endfor %}
+            </select>
+          </td>
+        </tr>
+        {% endfor %}
+        <tr>
+          <td><input type="text" name="new_tag" maxlength="100" placeholder="Other tag" autocomplete="off" aria-label="Other ClickUp tag"></td>
+          <td>
+            <select name="new_role" aria-label="Discord role for the other tag">
+              <option value="">None</option>
+              {% for r in roles %}
+              <option value="{{ r.id }}">@{{ r.name }}{% if !r.mentionable %} (not mentionable){% endif %}</option>
+              {% endfor %}
+            </select>
+          </td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">{% if workspace.is_some() %}Tags of the selected workspace are listed.{% else %}Select a workspace to list its tags.{% endif %} Use the last row for a tag that is not listed.</p>
+    <div class="actions"><button class="btn btn-primary" type="submit">Save tag roles</button></div>
+  </form>
+  {% endif %}
+</section>
 {% endblock %}

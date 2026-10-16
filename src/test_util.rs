@@ -33,6 +33,10 @@ pub const OTHER_CHANNEL_ID: u64 = 9_300_000_000_000_000_003;
 pub const VOICE_CHANNEL_ID: u64 = 9_300_000_000_000_000_004;
 pub const EMOJI_ID: u64 = 9_300_000_000_000_000_005;
 pub const MEMBER_ID: u64 = 9_300_000_000_000_000_010;
+/// A mentionable role.
+pub const ROLE_ID: u64 = 9_300_000_000_000_000_020;
+/// A role that is not mentionable.
+pub const LEADS_ROLE_ID: u64 = 9_300_000_000_000_000_021;
 
 /// Fresh migrated database. Every `:memory:` connection is its own database, so the pool
 /// holds exactly one connection and never recycles it.
@@ -123,6 +127,14 @@ fn guild_json() -> serde_json::Value {
             "guild_id": GUILD_ID.to_string(), "permission_overwrites": [], "nsfw": false
         })
     };
+    let role = |id: u64, name: &str, mentionable: bool, position: u16| {
+        serde_json::json!({
+            "id": id.to_string(), "name": name, "color": 0, "hoist": false,
+            "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
+            "managed": false, "mentionable": mentionable, "permissions": "0",
+            "position": position, "flags": 0
+        })
+    };
     serde_json::json!({
         "id": GUILD_ID.to_string(),
         "name": GUILD_NAME,
@@ -138,11 +150,11 @@ fn guild_json() -> serde_json::Value {
         "preferred_locale": "en-US",
         "features": [],
         "premium_progress_bar_enabled": false,
-        "roles": [{
-            "id": GUILD_ID.to_string(), "name": "@everyone", "color": 0, "hoist": false,
-            "colors": {"primary_color": 0, "secondary_color": null, "tertiary_color": null},
-            "managed": false, "mentionable": false, "permissions": "0", "position": 0, "flags": 0
-        }],
+        "roles": [
+            role(GUILD_ID, "@everyone", false, 0),
+            role(ROLE_ID, "Team", true, 2),
+            role(LEADS_ROLE_ID, "Leads", false, 1),
+        ],
         "emojis": [{
             "id": EMOJI_ID.to_string(), "name": "party", "animated": false, "available": true,
             "managed": false, "require_colons": true, "roles": []

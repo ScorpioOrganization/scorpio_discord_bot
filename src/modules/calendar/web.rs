@@ -21,7 +21,7 @@ use super::{
     save_config, update_rule, was_sent,
 };
 use crate::auth::extract::CurrentUser;
-use crate::bot::info::{self, ChannelOption, GuildSummary};
+use crate::bot::info::{self, ChannelOption, GuildSummary, RoleOption};
 use crate::clickup::ClickUpError;
 use crate::clickup::tokens::{self, Credential};
 use crate::clickup::web::{TokenView, token_routes, token_view};
@@ -73,6 +73,13 @@ fn channels(state: &AppState, gid: u64) -> Vec<ChannelOption> {
     state
         .discord()
         .map(|d| info::text_channels(&d.cache, gid))
+        .unwrap_or_default()
+}
+
+fn guild_roles(state: &AppState, gid: u64) -> Vec<RoleOption> {
+    state
+        .discord()
+        .map(|d| info::roles(&d.cache, gid))
         .unwrap_or_default()
 }
 
@@ -293,6 +300,52 @@ fn channel_warning(rule: &Rule, channels: &[ChannelOption]) -> Option<String> {
     None
 }
 
+/// Problems with a rule's role pings, or None when it is fine or the rule does not ping roles.
+fn role_warning(
+    rule: &Rule,
+    channels: &[ChannelOption],
+    roles: &[RoleOption],
+    tag_roles: &HashMap<String, u64>,
+) -> Option<String> {
+    if !rule.mention_roles {
+        return None;
+    }
+    let name = &rule.name;
+    let uses_roles = rule.item_template.contains("{roles}")
+        || (rule.kind == Kind::Digest && rule.header_template.contains("{roles}"));
+    if !uses_roles {
+        return Some(format!(
+            "Rule \"{name}\" pings roles, but its messages have no {{roles}} placeholder."
+        ));
+    }
+    if tag_roles.is_empty() {
+        return Some(format!(
+            "Rule \"{name}\" pings roles, but no ClickUp tag is mapped to a role yet. Map tags \
+             on the ClickUp page."
+        ));
+    }
+    let channel = rule
+        .channel_id
+        .and_then(|id| channels.iter().find(|c| c.id == id))?;
+    if channel.can_mention_all {
+        return None;
+    }
+    let silent: Vec<String> = roles
+        .iter()
+        .filter(|r| !r.mentionable && tag_roles.values().any(|id| *id == r.id))
+        .map(|r| format!("@{}", r.name))
+        .collect();
+    if silent.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The bot lacks the Mention All Roles permission in #{}, so rule \"{name}\" cannot ping \
+         roles that are not mentionable: {}.",
+        channel.name,
+        silent.join(", ")
+    ))
+}
+
 async fn page(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
@@ -314,8 +367,11 @@ async fn page(
     if cfg.list_id.is_none() {
         warnings.push("No ClickUp list is selected yet, so nothing is posted.".into());
     }
+    let roles = guild_roles(&state, gid);
+    let tag_roles = clickup::tag_roles(&state, gid).await?;
     for rule in rules.iter().filter(|r| r.enabled) {
         warnings.extend(channel_warning(rule, &channel_list));
+        warnings.extend(role_warning(rule, &channel_list, &roles, &tag_roles));
     }
     if rules.iter().any(|r| r.enabled && r.mention_assignees)
         && !state
@@ -439,7 +495,7 @@ async fn page(
             schedule: r.schedule_text(),
             next_run: match r.kind {
                 Kind::Digest if r.enabled => {
-                    schedule::next_occurrence(now, r.days, r.time_of_day, &tz)
+                    schedule::next_occurrence(now, r.days, r.time_of_day, &r.tz())
                 }
                 _ => None,
             },
@@ -519,7 +575,7 @@ async fn save_source(
         "due" | "start" => form.time_field.clone(),
         _ => return Err(AppError::BadRequest),
     };
-    let Some(tz) = schedule::parse_tz(&form.timezone) else {
+    let Some(timezone) = schedule::tz_name(&form.timezone) else {
         return Ok(redirect_msg(&back, "timezone_invalid"));
     };
     let Some(tags) = parse_tags(&form.tag_filter) else {
@@ -565,10 +621,7 @@ async fn save_source(
         list_id,
         list_name,
         time_field,
-        timezone: tz
-            .iana_name()
-            .map(str::to_owned)
-            .unwrap_or_else(|| form.timezone.trim().to_owned()),
+        timezone,
         tag_filter: tags.join(", "),
         include_subtasks: form.include_subtasks.is_some(),
         include_closed: form.include_closed.is_some(),
@@ -618,7 +671,9 @@ struct RulePage {
     emojis: Vec<EmojiOption>,
     quick_reactions: &'static [&'static str],
     preview: String,
+    /// The zone preview times are shown in: the rule's for digests, the default otherwise.
     timezone: String,
+    tz_names: &'static [String],
     warnings: Vec<String>,
     max_len: usize,
 }
@@ -646,6 +701,13 @@ async fn rule_page(
     }
     if !is_new {
         warnings.extend(channel_warning(&rule, &channel_list));
+        let tag_roles = clickup::tag_roles(state, gid).await?;
+        warnings.extend(role_warning(
+            &rule,
+            &channel_list,
+            &guild_roles(state, gid),
+            &tag_roles,
+        ));
     }
     if is_new && count_rules(&state.db, gid).await? >= MAX_RULES {
         warnings.push(format!(
@@ -678,7 +740,11 @@ async fn rule_page(
         emojis: guild_emojis(state, gid),
         quick_reactions: QUICK_REACTIONS,
         preview,
-        timezone: cfg.timezone,
+        timezone: match rule.kind {
+            Kind::Digest => rule.timezone.clone(),
+            Kind::Reminder => cfg.timezone,
+        },
+        tz_names: schedule::tz_names(),
         warnings,
         max_len: MAX_TEMPLATE_LEN,
         rule,
@@ -701,7 +767,10 @@ async fn new_rule(
 ) -> AppResult<Html<String>> {
     require_guild(&state, gid)?;
     let kind = Kind::parse(q.kind.as_deref().unwrap_or("digest")).ok_or(AppError::BadRequest)?;
-    rule_page(&state, &user, &q.msg, gid, Rule::new(kind), true).await
+    let mut rule = Rule::new(kind);
+    // The browser's zone replaces this when scripts run, see `data-detect-tz`.
+    rule.timezone = load_config(&state.db, gid).await?.timezone;
+    rule_page(&state, &user, &q.msg, gid, rule, true).await
 }
 
 async fn edit_rule(
@@ -727,6 +796,14 @@ fn template_field(raw: Option<&str>) -> Result<String, &'static str> {
         return Err("template_long");
     }
     Ok(value.to_owned())
+}
+
+/// Like [`template_field`], but empty is allowed and means "none".
+fn optional_template_field(raw: Option<&str>) -> Result<String, &'static str> {
+    match template_field(raw) {
+        Err("template_empty") => Ok(String::new()),
+        other => other,
+    }
 }
 
 fn number<T: std::str::FromStr + PartialOrd>(
@@ -791,6 +868,8 @@ fn parse_rule_form(
             rule.days = days;
             rule.time_of_day =
                 schedule::parse_hhmm(get("time").unwrap_or_default()).ok_or("rule_time")?;
+            rule.timezone =
+                schedule::tz_name(get("timezone").unwrap_or_default()).ok_or("timezone_invalid")?;
             rule.lookahead_hours = number(get("lookahead_hours"), 1..=336, "rule_lookahead")?;
             rule.layout = if get("layout") == Some("per_event") {
                 Layout::PerEvent
@@ -799,7 +878,7 @@ fn parse_rule_form(
             };
             rule.max_events = number(get("max_events"), 1..=50, "rule_max_events")?;
             rule.post_when_empty = checked("post_when_empty");
-            rule.header_template = template_field(get("header_template"))?;
+            rule.header_template = optional_template_field(get("header_template"))?;
             rule.empty_template = template_field(get("empty_template"))?;
         }
         Kind::Reminder => {
@@ -809,6 +888,7 @@ fn parse_rule_form(
 
     rule.item_template = template_field(get("item_template"))?;
     rule.mention_assignees = checked("mention_assignees");
+    rule.mention_roles = checked("mention_roles");
     rule.use_embed = checked("use_embed");
     rule.embed_color =
         text::parse_hex_color(get("embed_color").unwrap_or_default()).ok_or("invalid_color")?;
@@ -927,6 +1007,55 @@ async fn test_rule(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_warnings() {
+        let mut rule = Rule::new(Kind::Reminder);
+        rule.name = "Ping".into();
+        rule.channel_id = Some(1);
+        rule.item_template = "{title} {roles}".into();
+        let mut channels = vec![ChannelOption {
+            id: 1,
+            name: "events".into(),
+            can_send: true,
+            can_embed: true,
+            can_react: true,
+            can_mention_all: false,
+            selected: false,
+        }];
+        let role = |id, name: &str, mentionable| RoleOption {
+            id,
+            name: name.into(),
+            mentionable,
+        };
+        let roles = [role(10, "Team", true), role(11, "Leads", false)];
+        let mut tags = HashMap::from([("meeting".to_owned(), 10)]);
+        assert!(
+            role_warning(&rule, &channels, &roles, &tags).is_none(),
+            "off"
+        );
+
+        rule.mention_roles = true;
+        assert!(role_warning(&rule, &channels, &roles, &tags).is_none());
+        assert!(
+            role_warning(&rule, &channels, &roles, &HashMap::new())
+                .unwrap()
+                .contains("no ClickUp tag")
+        );
+        tags.insert("leads".into(), 11);
+        let warning = role_warning(&rule, &channels, &roles, &tags).unwrap();
+        assert!(warning.contains("#events") && warning.contains("@Leads"));
+        assert!(!warning.contains("@Team"));
+        channels[0].can_mention_all = true;
+        assert!(role_warning(&rule, &channels, &roles, &tags).is_none());
+
+        rule.item_template = "{title}".into();
+        assert!(
+            role_warning(&rule, &channels, &roles, &tags)
+                .unwrap()
+                .contains("no {roles} placeholder")
+        );
+    }
 
     #[test]
     fn manual_list_ids_and_urls() {

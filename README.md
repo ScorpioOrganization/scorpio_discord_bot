@@ -5,7 +5,7 @@ Discord bot with a web dashboard. Every module can be switched on or off per ser
 Modules:
 
 - **Greeting**: posts a customizable welcome message to a chosen channel when someone joins the server.
-- **ClickUp**: stores the ClickUp API key other modules can share and matches ClickUp people to server members.
+- **ClickUp**: stores the ClickUp API key other modules can share, matches ClickUp people to server members and maps ClickUp tags to server roles.
 - **Calendar**: reads meetings and events from a ClickUp list and posts scheduled agendas and reminders before each event.
 
 ## Discord setup
@@ -13,7 +13,7 @@ Modules:
 1. Create an application at https://discord.com/developers/applications and add a bot.
 2. On the **Bot** tab, enable **Server Members Intent** (required to see members joining, and to match ClickUp people to members).
 3. Copy the bot token into `.env` as `DISCORD_TOKEN`.
-4. Invite the bot with **OAuth2 > URL Generator**: scope `bot`, permissions `View Channels`, `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History` (the last two let the Calendar module add reactions).
+4. Invite the bot with **OAuth2 > URL Generator**: scope `bot`, permissions `View Channels`, `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History` (the last two let the Calendar module add reactions). To let the Calendar module ping roles that are not mentionable, also grant `Mention Everyone` (shown as "Mention @everyone, @here, and All Roles"); the bot still never pings `@everyone` or `@here`.
 
 ## Running
 
@@ -129,6 +129,7 @@ Configured per server under **Overview > server > ClickUp**:
 - **API key**: the shared key other ClickUp modules use by default. Those modules can also keep a separate key of their own. Other modules can only use the shared key while this module is enabled.
 - **Workspace**: the ClickUp workspace whose people are listed for matching.
 - **People**: every person of the workspace with the server member they are matched to.
+- **Tags to roles**: ClickUp tags (those of the workspace's spaces, or typed in) mapped to server roles. Modules use them for the `{roles}` placeholder. Tags are matched ignoring case.
 
 People are matched to server members by name automatically. Accents, dots, underscores and word order are ignored (`Igor Zawórski` matches `igor_zaworski` and `Zaworski Igor`), the email address before the `@` counts too, and small typos are tolerated. A first name alone is never enough, and when two members fit equally well the person stays unmatched instead of guessing. Each member is matched to at most one person.
 
@@ -138,14 +139,14 @@ To pin a person, type a Discord username, display name, `@name`, user ID or `<@i
 
 Configured per server under **Overview > server > Calendar**. The bot reads one ClickUp list (the list behind your calendar or board) and never changes it.
 
-**Source**: the list (picked from your workspaces, or pasted as an ID or list URL), whether an event happens at its due date or its start date (falling back to the due date), the time zone used for digest schedules, an optional tag filter (tasks with any of up to 5 tags), and whether subtasks and closed tasks count. Tasks without the chosen date are ignored.
+**Source**: the list (picked from your workspaces, or pasted as an ID or list URL), whether an event happens at its due date or its start date (falling back to the due date), the default time zone (for new digest rules and the times shown on the page), an optional tag filter (tasks with any of up to 5 tags), and whether subtasks and closed tasks count. Tasks without the chosen date are ignored.
 
 **Rules** (up to 20 per server), each with its own channel:
 
-- **Digest**: on the chosen weekdays at a time of day, posts the events of the next N hours, either as one message listing them (with a header) or as one message per event. Optionally posts a message when there are no events.
+- **Digest**: on the chosen weekdays at a time of day in the rule's own time zone, posts the events of the next N hours, either as one message listing them or as one message per event. The optional header starts the listing message, or is posted as its own first message in the one message per event layout. Optionally posts a message when there are no events. A new digest rule takes the time zone of your browser (or the server default without JavaScript).
 - **Reminder**: posts once for every event, a set number of minutes before it starts. If the event is moved, it is reminded again before the new time.
 
-Every rule has a message template, a description length, an embed option with color, up to 5 reactions the bot adds to its messages (any emoji, or custom emojis of the server), and whether matched assignees are pinged.
+Every rule has a message template, a description length, an embed option with color, up to 5 reactions the bot adds to its messages (any emoji, or custom emojis of the server), whether matched assignees are pinged, and whether roles mapped from task tags are pinged.
 
 Placeholders for each event:
 
@@ -160,12 +161,13 @@ Placeholders for each event:
 | `{assignees}` | assignees, as member mentions when matched, else their ClickUp names |
 | `{description}` | task description, cut to the configured length |
 | `{status}`, `{tags}`, `{priority}`, `{list}` | task status, tags, priority and list name |
+| `{roles}` | roles mapped from the task's tags (ClickUp page), as role mentions |
 
-The digest header and the "no events" message know `{count}`, `{list}` and `{date}`. Times are Discord timestamps, so every reader sees them in their own time zone. A template line whose placeholders all come out empty is left out.
+The digest header and the "no events" message know `{count}`, `{list}`, `{date}` and `{roles}` (the roles of all listed events). Times are Discord timestamps, so every reader sees them in their own time zone. A template line whose placeholders all come out empty is left out.
 
 Behavior worth knowing:
 
-- Matched assignees always appear as mentions, but they are only pinged when the rule says so. Roles, `@everyone` and `@here` never ping. Test messages never ping anyone.
+- Matched assignees and mapped roles always appear as mentions, but they are only pinged when the rule says so. Only roles mapped from the event's tags can ping, and only if the role is mentionable or the bot has the `Mention Everyone` permission in the channel (the page warns otherwise). `@everyone` and `@here` never ping. Test messages never ping anyone.
 - A digest that could not be posted within 2 hours of its time (bot offline, ClickUp down) is skipped and shown as missed, not posted late.
 - If Discord refuses a message (missing permission, deleted channel) it is logged and counted, and not retried every minute. A reaction that cannot be added does not make the post count as failed.
 - At most 10 reminders per rule are posted per minute, so a backlog cannot flood a channel.
@@ -182,7 +184,7 @@ Behavior worth knowing:
 - Strict Content Security Policy, no inline scripts or styles, frame embedding denied.
 - Third party API keys are encrypted at rest with a key that is not in the database, write-only in the dashboard and never logged.
 - ClickUp access is read-only by construction: the client only implements GET requests.
-- Messages restrict pings to the users a module explicitly allows.
+- Messages restrict pings to the users and roles a module explicitly allows, never `@everyone` or `@here`.
 
 ## Adding a module
 
@@ -192,7 +194,7 @@ Behavior worth knowing:
 
 The guild page lists the module with an enable/disable switch automatically, and the bot only calls its hooks in servers where it is enabled. Modules that work on a schedule return `true` from `ticks()` and get `on_tick` about once a minute per server.
 
-A module that reads ClickUp reuses the shared pieces instead of handling keys itself: `clickup::web::token_routes("<id>")` and `templates/clickup/token_card.html` give it the API key card (shared or own key), `clickup::tokens::resolve` and `track` give it a key and record each call, and `modules::clickup::resolver` matches ClickUp people to members. The Calendar module is the example.
+A module that reads ClickUp reuses the shared pieces instead of handling keys itself: `clickup::web::token_routes("<id>")` and `templates/clickup/token_card.html` give it the API key card (shared or own key), `clickup::tokens::resolve` and `track` give it a key and record each call, `modules::clickup::resolver` matches ClickUp people to members and `modules::clickup::tag_roles` gives the tag to role mappings. The Calendar module is the example.
 
 ## Development
 

@@ -1,10 +1,11 @@
 //! Turning events into Discord messages.
 //!
 //! Times are Discord timestamp tags (`<t:...>`), so every reader sees their own time zone.
-//! Names and titles are markdown escaped. Matched assignees appear as `<@id>` mentions,
-//! which only ping when the rule allows it (see [`OutMessage::mention_users`]).
+//! Names and titles are markdown escaped. Matched assignees appear as `<@id>` mentions and
+//! roles mapped from task tags as `<@&id>`; they only ping when the rule allows it (see
+//! [`OutMessage::mention_users`] and [`OutMessage::mention_roles`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use jiff::tz::TimeZone;
 
@@ -12,6 +13,7 @@ use super::events::Event;
 use super::reactions::Reaction;
 use super::schedule::fmt_local_as;
 use super::{Layout, Rule};
+use crate::bot::info::RoleOption;
 use crate::bot::members::MemberInfo;
 use crate::clickup::mapping::Resolver;
 use crate::modules::text::{self, escape_markdown, truncate_chars};
@@ -39,6 +41,7 @@ pub const ITEM_PLACEHOLDERS: &[(&str, &str)] = &[
     ("{description}", "Task description, shortened"),
     ("{status}", "Status"),
     ("{tags}", "Tags"),
+    ("{roles}", "Roles mapped from the tags, as mentions"),
     ("{priority}", "Priority"),
     ("{list}", "ClickUp list name"),
 ];
@@ -47,10 +50,13 @@ pub const HEADER_PLACEHOLDERS: &[(&str, &str)] = &[
     ("{count}", "Number of events"),
     ("{list}", "ClickUp list name"),
     ("{date}", "Today's date"),
+    ("{roles}", "Roles of the listed events, as mentions"),
 ];
 
 pub struct Ctx<'a> {
     pub resolver: &'a Resolver,
+    /// Lowercase ClickUp tag to Discord role.
+    pub tag_roles: &'a HashMap<String, u64>,
     pub list_name: &'a str,
     pub now: i64,
 }
@@ -70,7 +76,23 @@ pub struct OutMessage {
     pub embed: Option<OutEmbed>,
     /// The only users this message may ping. Empty unless the rule mentions assignees.
     pub mention_users: Vec<u64>,
+    /// The only roles this message may ping. Empty unless the rule mentions roles.
+    pub mention_roles: Vec<u64>,
     pub reactions: Vec<Reaction>,
+}
+
+/// Users and roles that appear as mentions in a rendered text.
+#[derive(Debug, Default)]
+struct Mentions {
+    users: Vec<u64>,
+    roles: Vec<u64>,
+}
+
+impl Mentions {
+    fn extend(&mut self, other: &Mentions) {
+        self.users.extend_from_slice(&other.users);
+        self.roles.extend_from_slice(&other.roles);
+    }
 }
 
 fn stamp(ts: i64, style: char) -> String {
@@ -127,12 +149,33 @@ fn assignees(ev: &Event, ctx: &Ctx, mentioned: &mut Vec<u64>) -> String {
         .join(", ")
 }
 
+/// Roles mapped from the tags of `events`, deduplicated, in order of appearance.
+fn tag_roles<'e>(events: impl IntoIterator<Item = &'e Event>, ctx: &Ctx) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    events
+        .into_iter()
+        .flat_map(|e| e.tags.iter())
+        .filter_map(|t| ctx.tag_roles.get(&t.trim().to_lowercase()).copied())
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+fn role_mentions(ids: Vec<u64>, mentioned: &mut Mentions) -> String {
+    let text = ids
+        .iter()
+        .map(|id| format!("<@&{id}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    mentioned.roles.extend(ids);
+    text
+}
+
 fn event_text(
     template: &str,
     ev: &Event,
     rule: &Rule,
     ctx: &Ctx,
-    mentioned: &mut Vec<u64>,
+    mentioned: &mut Mentions,
 ) -> String {
     render_lines(template, |token| {
         Some(match token {
@@ -150,7 +193,8 @@ fn event_text(
             "relative" => stamp(ev.at, 'R'),
             "start" => ev.start.map(|t| stamp(t, 'f')).unwrap_or_default(),
             "due" => ev.due.map(|t| stamp(t, 'f')).unwrap_or_default(),
-            "assignees" => assignees(ev, ctx, mentioned),
+            "assignees" => assignees(ev, ctx, &mut mentioned.users),
+            "roles" => role_mentions(tag_roles([ev], ctx), mentioned),
             "description" => description(&ev.description, rule.description_max),
             "status" => escape_markdown(&ev.status),
             "tags" => escape_markdown(&ev.tags.join(", ")),
@@ -165,12 +209,21 @@ fn event_text(
     })
 }
 
-fn header_text(template: &str, count: usize, ctx: &Ctx) -> String {
+/// Header and empty message text. `count` is the number of events in the window, `listed`
+/// the ones the digest shows.
+fn header_text(
+    template: &str,
+    count: usize,
+    listed: &[Event],
+    ctx: &Ctx,
+    mentioned: &mut Mentions,
+) -> String {
     render_lines(template, |token| {
         Some(match token {
             "count" => count.to_string(),
             "list" => escape_markdown(ctx.list_name),
             "date" => stamp(ctx.now, 'D'),
+            "roles" => role_mentions(tag_roles(listed, ctx), mentioned),
             _ => return None,
         })
     })
@@ -182,22 +235,39 @@ pub fn digest_messages(rule: &Rule, events: &[Event], ctx: &Ctx) -> Vec<OutMessa
         if !rule.post_when_empty {
             return Vec::new();
         }
-        let text = header_text(&rule.empty_template, 0, ctx);
-        return vec![finish(rule, text, None, Vec::new())];
+        let mut mentioned = Mentions::default();
+        let text = header_text(&rule.empty_template, 0, &[], ctx, &mut mentioned);
+        return vec![finish(rule, text, None, mentioned)];
     }
+    let listed = &events[..events.len().min(rule.max_events as usize)];
     match rule.layout {
-        Layout::PerEvent => events
-            .iter()
-            .take(rule.max_events as usize)
-            .map(|e| event_message(rule, e, ctx))
-            .collect(),
+        Layout::PerEvent => {
+            let mut msgs = Vec::with_capacity(listed.len() + 1);
+            // The header goes first as its own message, without the reactions meant for
+            // events. An empty header template means no header.
+            let mut mentioned = Mentions::default();
+            let header = header_text(
+                &rule.header_template,
+                events.len(),
+                listed,
+                ctx,
+                &mut mentioned,
+            );
+            if !header.trim().is_empty() {
+                let mut msg = finish(rule, header, None, mentioned);
+                msg.reactions.clear();
+                msgs.push(msg);
+            }
+            msgs.extend(listed.iter().map(|e| event_message(rule, e, ctx)));
+            msgs
+        }
         Layout::Combined => vec![combined(rule, events, ctx)],
     }
 }
 
 /// One message about one event: reminders and per-event digests.
 pub fn event_message(rule: &Rule, ev: &Event, ctx: &Ctx) -> OutMessage {
-    let mut mentioned = Vec::new();
+    let mut mentioned = Mentions::default();
     let text = event_text(&rule.item_template, ev, rule, ctx, &mut mentioned);
     finish(rule, text, Some(ev), mentioned)
 }
@@ -213,10 +283,10 @@ fn combined(rule: &Rule, events: &[Event], ctx: &Ctx) -> OutMessage {
         CONTENT_MAX
     };
     let shown = events.len().min(rule.max_events as usize);
-    let items: Vec<(String, Vec<u64>)> = events[..shown]
+    let items: Vec<(String, Mentions)> = events[..shown]
         .iter()
         .map(|e| {
-            let mut m = Vec::new();
+            let mut m = Mentions::default();
             (event_text(&rule.item_template, e, rule, ctx, &mut m), m)
         })
         .collect();
@@ -226,8 +296,14 @@ fn combined(rule: &Rule, events: &[Event], ctx: &Ctx) -> OutMessage {
         "\n\n"
     };
 
-    let mut body = header_text(&rule.header_template, events.len(), ctx);
-    let mut mentioned = Vec::new();
+    let mut mentioned = Mentions::default();
+    let mut body = header_text(
+        &rule.header_template,
+        events.len(),
+        &events[..shown],
+        ctx,
+        &mut mentioned,
+    );
     let mut included = 0;
     for (i, (item, m)) in items.iter().enumerate() {
         let left_after = events.len() - (i + 1);
@@ -244,7 +320,7 @@ fn combined(rule: &Rule, events: &[Event], ctx: &Ctx) -> OutMessage {
             body.push_str(sep);
         }
         body.push_str(item);
-        mentioned.extend_from_slice(m);
+        mentioned.extend(m);
         included += 1;
     }
     let omitted = events.len() - included;
@@ -255,12 +331,26 @@ fn combined(rule: &Rule, events: &[Event], ctx: &Ctx) -> OutMessage {
     finish(rule, body, None, mentioned)
 }
 
-fn finish(rule: &Rule, text: String, ev: Option<&Event>, mut mentioned: Vec<u64>) -> OutMessage {
+fn dedupe(ids: &mut Vec<u64>) {
     let mut seen = HashSet::new();
-    mentioned.retain(|id| seen.insert(*id));
-    mentioned.truncate(MAX_MENTIONS);
+    ids.retain(|id| seen.insert(*id));
+    ids.truncate(MAX_MENTIONS);
+}
+
+fn finish(rule: &Rule, text: String, ev: Option<&Event>, mentioned: Mentions) -> OutMessage {
+    let Mentions {
+        mut users,
+        mut roles,
+    } = mentioned;
+    dedupe(&mut users);
+    dedupe(&mut roles);
     let mention_users = if rule.mention_assignees {
-        mentioned
+        users
+    } else {
+        Vec::new()
+    };
+    let mention_roles = if rule.mention_roles {
+        roles
     } else {
         Vec::new()
     };
@@ -271,6 +361,7 @@ fn finish(rule: &Rule, text: String, ev: Option<&Event>, mut mentioned: Vec<u64>
         let content = mention_users
             .iter()
             .map(|id| format!("<@{id}>"))
+            .chain(mention_roles.iter().map(|id| format!("<@&{id}>")))
             .collect::<Vec<_>>()
             .join(" ");
         let title = ev
@@ -294,6 +385,7 @@ fn finish(rule: &Rule, text: String, ev: Option<&Event>, mut mentioned: Vec<u64>
             content,
             embed: Some(embed),
             mention_users,
+            mention_roles,
             reactions,
         };
     }
@@ -309,20 +401,27 @@ fn finish(rule: &Rule, text: String, ev: Option<&Event>, mut mentioned: Vec<u64>
         content: truncate_chars(content, CONTENT_MAX),
         embed: None,
         mention_users,
+        mention_roles,
         reactions,
     }
 }
 
 /// Makes message text readable on the dashboard: timestamp tags become local times in `tz`
-/// and user mentions become `@name`.
-pub fn humanize(text: &str, tz: &TimeZone, members: &[MemberInfo], now: i64) -> String {
+/// and user and role mentions become `@name`.
+pub fn humanize(
+    text: &str,
+    tz: &TimeZone,
+    members: &[MemberInfo],
+    roles: &[RoleOption],
+    now: i64,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find('<') {
         out.push_str(&rest[..start]);
         let tail = &rest[start..];
         if let Some(end) = tail.find('>')
-            && let Some(readable) = humanize_tag(&tail[1..end], tz, members, now)
+            && let Some(readable) = humanize_tag(&tail[1..end], tz, members, roles, now)
         {
             out.push_str(&readable);
             rest = &tail[end + 1..];
@@ -335,7 +434,13 @@ pub fn humanize(text: &str, tz: &TimeZone, members: &[MemberInfo], now: i64) -> 
     out
 }
 
-fn humanize_tag(inner: &str, tz: &TimeZone, members: &[MemberInfo], now: i64) -> Option<String> {
+fn humanize_tag(
+    inner: &str,
+    tz: &TimeZone,
+    members: &[MemberInfo],
+    roles: &[RoleOption],
+    now: i64,
+) -> Option<String> {
     if let Some(t) = inner.strip_prefix("t:") {
         let (ts, style) = t.split_once(':').unwrap_or((t, "f"));
         let ts: i64 = ts.parse().ok()?;
@@ -346,6 +451,15 @@ fn humanize_tag(inner: &str, tz: &TimeZone, members: &[MemberInfo], now: i64) ->
             "t" | "T" => fmt_local_as(ts, tz, "%H:%M"),
             _ => fmt_local_as(ts, tz, "%Y-%m-%d %H:%M %Z"),
         });
+    }
+    if let Some(id) = inner.strip_prefix("@&") {
+        let id: u64 = id.parse().ok()?;
+        let name = roles
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "unknown role".into());
+        return Some(format!("@{name}"));
     }
     let id: u64 = inner
         .strip_prefix('@')?
@@ -418,10 +532,22 @@ mod tests {
         }
     }
 
+    const MEETING_ROLE: u64 = 500;
+    const TEAM_ROLE: u64 = 501;
+
+    fn tag_map() -> HashMap<String, u64> {
+        HashMap::from([
+            ("meeting".to_owned(), MEETING_ROLE),
+            ("team".to_owned(), TEAM_ROLE),
+        ])
+    }
+
     fn with<R>(f: impl FnOnce(&Ctx) -> R) -> R {
         let r = resolver();
+        let tags = tag_map();
         f(&Ctx {
             resolver: &r,
+            tag_roles: &tags,
             list_name: "Events / Calendar",
             now: NOW,
         })
@@ -431,7 +557,7 @@ mod tests {
     fn every_placeholder() {
         let mut rule = Rule::new(Kind::Reminder);
         rule.item_template = "{title}|{link}|{url}|{when}|{date}|{time}|{relative}|{start}|{due}\
-            |{assignees}|{status}|{tags}|{priority}|{list}|{nope}"
+            |{assignees}|{status}|{tags}|{roles}|{priority}|{list}|{nope}"
             .into();
         let ev = event("abc", "Plan [Q4] *now*", NOW + 60);
         let msg = with(|ctx| event_message(&rule, &ev, ctx));
@@ -441,10 +567,15 @@ mod tests {
             format!(
                 "Plan \\[Q4\\] \\*now\\*|[Plan \\[Q4\\] \\*now\\*](<https://app.clickup.com/t/abc>)\
                  |<https://app.clickup.com/t/abc>|<t:{t}:F>|<t:{t}:D>|<t:{t}:t>|<t:{t}:R>||<t:{t}:f>\
-                 |<@77>, Bob\\_the \\*Builder\\*|to do|meeting, team|high|Calendar|{{nope}}"
+                 |<@77>, Bob\\_the \\*Builder\\*|to do|meeting, team|<@&500> <@&501>|high|Calendar\
+                 |{{nope}}"
             )
         );
         assert!(msg.mention_users.is_empty(), "mentions are off by default");
+        assert!(
+            msg.mention_roles.is_empty(),
+            "role pings are off by default"
+        );
         assert!(msg.embed.is_none());
     }
 
@@ -483,6 +614,83 @@ mod tests {
         assert_eq!(embed.url.as_deref(), Some("https://app.clickup.com/t/a"));
         assert_eq!(embed.timestamp, Some(NOW + 60));
         assert_eq!(embed.color, rule.embed_color);
+    }
+
+    #[test]
+    fn roles_come_from_mapped_tags() {
+        let mut rule = Rule::new(Kind::Reminder);
+        rule.item_template = "{title}\n{roles}".into();
+        let mut ev = event("a", "Sync", NOW + 60);
+        ev.tags = vec!["Meeting".into(), "other".into(), " meeting ".into()];
+        let msg = with(|ctx| event_message(&rule, &ev, ctx));
+        assert_eq!(
+            msg.content, "Sync\n<@&500>",
+            "case insensitive, deduplicated"
+        );
+        assert!(msg.mention_roles.is_empty());
+
+        rule.mention_roles = true;
+        let msg = with(|ctx| event_message(&rule, &ev, ctx));
+        assert_eq!(msg.mention_roles, [MEETING_ROLE]);
+        assert!(msg.mention_users.is_empty(), "assignee pings stay separate");
+
+        // Without a mapped tag the line disappears and nothing is pinged.
+        ev.tags = vec!["other".into()];
+        let msg = with(|ctx| event_message(&rule, &ev, ctx));
+        assert_eq!(msg.content, "Sync");
+        assert!(msg.mention_roles.is_empty());
+
+        // Roles only ping where the placeholder is used.
+        ev.tags = vec!["team".into()];
+        rule.item_template = "{title}".into();
+        let msg = with(|ctx| event_message(&rule, &ev, ctx));
+        assert!(msg.mention_roles.is_empty());
+
+        rule.item_template = "{title} {roles} {assignees}".into();
+        rule.mention_assignees = true;
+        rule.use_embed = true;
+        let msg = with(|ctx| event_message(&rule, &ev, ctx));
+        assert_eq!(msg.content, "<@77> <@&501>", "pings go outside the embed");
+        assert_eq!(msg.mention_roles, [TEAM_ROLE]);
+    }
+
+    #[test]
+    fn per_event_digests_start_with_the_header() {
+        let mut rule = Rule::new(Kind::Digest);
+        rule.layout = Layout::PerEvent;
+        rule.header_template = "**{count} events** {roles}".into();
+        rule.item_template = "{title}".into();
+        rule.mention_roles = true;
+        rule.reactions = reactions::parse("✅").unwrap();
+        let mut events: Vec<Event> = (0..2)
+            .map(|i| event(&i.to_string(), &format!("E{i}"), NOW + i))
+            .collect();
+        events[0].tags = vec!["meeting".into()];
+        events[1].tags = vec!["team".into(), "meeting".into()];
+        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "**2 events** <@&500> <@&501>");
+        assert_eq!(msgs[0].mention_roles, [MEETING_ROLE, TEAM_ROLE]);
+        assert!(msgs[0].reactions.is_empty(), "reactions are for events");
+        assert_eq!(msgs[1].content, "E0");
+        assert_eq!(msgs[2].reactions.len(), 1);
+        assert!(msgs[1].mention_roles.is_empty(), "no {{roles}} in the item");
+
+        // An empty header means no header message, in both layouts.
+        rule.header_template = String::new();
+        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "E0");
+        rule.layout = Layout::Combined;
+        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        assert_eq!(msgs[0].content, "E0\nE1");
+
+        // A header whose placeholders are all empty is not sent either.
+        rule.layout = Layout::PerEvent;
+        rule.header_template = "{roles}".into();
+        events.iter_mut().for_each(|e| e.tags.clear());
+        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]
@@ -559,7 +767,11 @@ mod tests {
         let events: Vec<Event> = (0..3)
             .map(|i| event(&i.to_string(), "E", NOW + i))
             .collect();
-        assert_eq!(with(|ctx| digest_messages(&rule, &events, ctx)).len(), 2);
+        assert_eq!(
+            with(|ctx| digest_messages(&rule, &events, ctx)).len(),
+            3,
+            "the header and max_events events"
+        );
 
         assert!(with(|ctx| digest_messages(&rule, &[], ctx)).is_empty());
         rule.post_when_empty = true;
@@ -571,14 +783,20 @@ mod tests {
     #[test]
     fn humanize_for_previews() {
         let tz = TimeZone::UTC;
+        let roles = [RoleOption {
+            id: MEETING_ROLE,
+            name: "Team".into(),
+            mentionable: true,
+        }];
         let text = format!(
-            "<t:{NOW}:F> <t:{NOW}:D> <t:{NOW}:t> <t:{}:R> <@77> <@!5> <https://x.io> a<b",
+            "<t:{NOW}:F> <t:{NOW}:D> <t:{NOW}:t> <t:{}:R> <@77> <@!5> <@&500> <@&9> \
+             <https://x.io> a<b",
             NOW + 7200
         );
         assert_eq!(
-            humanize(&text, &tz, &members(), NOW),
-            "2027-01-15 08:00 UTC 2027-01-15 08:00 in 2h 0m @Anna Nowak @unknown member \
-             <https://x.io> a<b"
+            humanize(&text, &tz, &members(), &roles, NOW),
+            "2027-01-15 08:00 UTC 2027-01-15 08:00 in 2h 0m @Anna Nowak @unknown member @Team \
+             @unknown role <https://x.io> a<b"
         );
     }
 }

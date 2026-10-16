@@ -4,7 +4,7 @@
 
 mod web;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use serenity::all::GatewayIntents;
 use sqlx::SqlitePool;
 
 use super::{Module, StatItem};
+use crate::bot::info::roles;
 use crate::bot::members::guild_members;
 use crate::clickup::client::User;
 use crate::clickup::mapping::{Explicit, Resolver};
@@ -24,6 +25,8 @@ pub const ID: &str = tokens::SHARED;
 /// Upper bound for mapping rows saved in one request.
 pub const MAX_MAPPINGS: usize = 500;
 const MAX_NAME_LEN: usize = 100;
+/// Upper bound for tag to role mappings per guild.
+pub const MAX_TAG_ROLES: i64 = 200;
 
 pub struct ClickUpModule;
 
@@ -193,6 +196,84 @@ pub async fn set_mapping(
     Ok(())
 }
 
+/// A ClickUp tag as stored for role mappings: trimmed and lowercase, since ClickUp tags are
+/// matched case insensitively. None when empty or too long.
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let tag = raw.trim().to_lowercase();
+    (!tag.is_empty() && tag.chars().count() <= MAX_NAME_LEN).then_some(tag)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TagRoleRow {
+    pub tag: String,
+    pub role_id: i64,
+}
+
+pub async fn tag_role_rows(db: &SqlitePool, guild_id: u64) -> Result<Vec<TagRoleRow>> {
+    Ok(
+        sqlx::query_as(
+            "SELECT tag, role_id FROM clickup_tag_roles WHERE guild_id = ? ORDER BY tag",
+        )
+        .bind(sf(guild_id))
+        .fetch_all(db)
+        .await?,
+    )
+}
+
+/// Maps `tag` (normalized by the caller) to a role, or removes its mapping with None.
+pub async fn set_tag_role(
+    db: &SqlitePool,
+    guild_id: u64,
+    tag: &str,
+    role_id: Option<u64>,
+    by: &str,
+) -> Result<()> {
+    let Some(role_id) = role_id else {
+        sqlx::query("DELETE FROM clickup_tag_roles WHERE guild_id = ? AND tag = ?")
+            .bind(sf(guild_id))
+            .bind(tag.to_owned())
+            .execute(db)
+            .await?;
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO clickup_tag_roles (guild_id, tag, role_id, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (guild_id, tag) DO UPDATE SET
+             role_id = excluded.role_id,
+             updated_at = excluded.updated_at,
+             updated_by = excluded.updated_by",
+    )
+    .bind(sf(guild_id))
+    .bind(tag.to_owned())
+    .bind(sf(role_id))
+    .bind(now())
+    .bind(by.to_owned())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Lowercase tag to role id for a guild. Roles deleted in Discord are left out while the
+/// bot can see the guild.
+pub async fn tag_roles(state: &AppState, guild_id: u64) -> Result<HashMap<String, u64>> {
+    let rows = tag_role_rows(&state.db, guild_id).await?;
+    let existing: Option<HashSet<u64>> = state.discord().and_then(|d| {
+        d.cache.guild(serenity::all::GuildId::new(guild_id))?;
+        Some(
+            roles(&d.cache, guild_id)
+                .into_iter()
+                .map(|r| r.id)
+                .collect(),
+        )
+    });
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.tag, r.role_id as u64))
+        .filter(|(_, id)| existing.as_ref().is_none_or(|ids| ids.contains(id)))
+        .collect())
+}
+
 /// Name matcher for a guild: explicit mappings plus automatic matching against the current
 /// member list. `people` (usually the workspace members) are matched one-to-one up front;
 /// anyone else, like a task assignee from another workspace, is matched on demand.
@@ -242,6 +323,51 @@ mod tests {
         set_mapping(&db, 1, 5, "Anna", None, "root").await.unwrap();
         assert!(!explicit_mappings(&db, 1).await.unwrap().contains_key(&5));
         assert_eq!(explicit_mappings(&db, 2).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tag_roles_round_trip() {
+        assert_eq!(normalize_tag("  Team Sync ").as_deref(), Some("team sync"));
+        assert!(normalize_tag("   ").is_none());
+        assert!(normalize_tag(&"x".repeat(101)).is_none());
+
+        let state = test_util::state().await;
+        let db = &state.db;
+        let big = u64::MAX - 1;
+        set_tag_role(db, 1, "meeting", Some(5), "root")
+            .await
+            .unwrap();
+        set_tag_role(db, 1, "meeting", Some(big), "root")
+            .await
+            .unwrap();
+        set_tag_role(db, 1, "team", Some(6), "root").await.unwrap();
+        set_tag_role(db, 2, "meeting", Some(7), "root")
+            .await
+            .unwrap();
+        let map = tag_roles(&state, 1).await.unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["meeting"], big);
+
+        set_tag_role(db, 1, "team", None, "root").await.unwrap();
+        let rows = tag_role_rows(db, 1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(tag_role_rows(db, 2).await.unwrap()[0].role_id, 7);
+    }
+
+    #[tokio::test]
+    async fn tag_roles_skip_deleted_roles() {
+        let state = test_util::state().await;
+        test_util::connect_fake_discord(&state);
+        let gid = test_util::GUILD_ID;
+        set_tag_role(&state.db, gid, "meeting", Some(test_util::ROLE_ID), "root")
+            .await
+            .unwrap();
+        set_tag_role(&state.db, gid, "gone", Some(12345), "root")
+            .await
+            .unwrap();
+        let map = tag_roles(&state, gid).await.unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["meeting"], test_util::ROLE_ID);
     }
 
     #[tokio::test]

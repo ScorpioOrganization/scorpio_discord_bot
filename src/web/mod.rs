@@ -212,6 +212,16 @@ impl Flash {
                  user ID. Nothing was saved.",
             ),
             "members_refreshed" => (true, "Server members reloaded."),
+            "tag_roles_saved" => (true, "Tag roles saved."),
+            "role_unknown" => (false, "Pick a role from this server. Nothing was saved."),
+            "tag_invalid" => (
+                false,
+                "Tags must be 1 to 100 characters. Nothing was saved.",
+            ),
+            "too_many_tag_roles" => (
+                false,
+                "This server has the maximum number of tag roles. Nothing was saved.",
+            ),
             "clickup_disabled" => (
                 false,
                 "This module uses the shared ClickUp key, but the ClickUp module is disabled. \
