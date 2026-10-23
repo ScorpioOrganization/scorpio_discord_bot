@@ -15,6 +15,10 @@ ignore = [
     { id = "RUSTSEC-2026-0104", reason = "panic in CRL parsing; the gateway client does not use CRLs" },
     { id = "RUSTSEC-2026-0098", reason = "URI name constraints; needs a misissuing CA, no fixed webpki 0.102, gateway only" },
     { id = "RUSTSEC-2026-0099", reason = "wildcard name constraints; needs a misissuing CA, no fixed webpki 0.102, gateway only" },
+    { id = "RUSTSEC-2026-0382", reason = "distrusted emSign intermediates; no fixed webpki 0.102, gateway roots come from webpki-roots >= 1.0.10 which dropped the emSign root" },
+    # basic-toml comes only from askama_derive (askama 0.16.1 is latest) and only reads an
+    # askama.toml at compile time. Drop this once askama moves to the toml crate.
+    { id = "RUSTSEC-2026-0374", reason = "unmaintained, not a vulnerability; compile time only, parses no untrusted input" },
 ]
 
 [licenses]
