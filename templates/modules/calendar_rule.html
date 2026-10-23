@@ -68,9 +68,14 @@
       <button type="button" class="chip" data-local-tz="rule-tz" hidden>Use my time zone</button>
     </div>
     <label class="inline-field">
+      <span>Skip events of the first (minutes)</span>
+      <input type="number" name="offset_minutes" value="{{ rule.offset_minutes }}" min="0" max="10080">
+    </label>
+    <label class="inline-field">
       <span>Include events of the next (hours)</span>
       <input type="number" name="lookahead_hours" value="{{ rule.lookahead_hours }}" min="1" max="336" required>
     </label>
+    <p class="hint">The listed events start the skipped minutes after the scheduled time. For example a post at 20:00 that skips 240 minutes and includes 24 hours lists the events of the next day, 00:00 to 24:00.</p>
     <label>
       <span>Layout</span>
       <select name="layout">
@@ -163,13 +168,13 @@
       {% else %}
       <pre class="preview">{{ preview }}</pre>
       {% endif %}
-      <p class="hint">The saved rule with current events from ClickUp (or a sample event). Times are shown in {{ timezone }}; in Discord everyone sees their own time zone.</p>
+      <p class="hint">{% if is_digest %}The next scheduled post of the saved rule{% else %}The saved rule{% endif %} with current events from ClickUp (or a sample event). Times are shown in {{ timezone }}; in Discord everyone sees their own time zone.</p>
       {% if !is_new %}
       <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules/{{ rule.id }}/test" class="actions">
         <input type="hidden" name="_csrf" value="{{ page.csrf }}">
         <button class="btn btn-secondary" type="submit">Send test message</button>
       </form>
-      <p class="hint">Posts what this rule would post right now to its channel. Test messages never ping anyone.</p>
+      <p class="hint">Posts the preview above to the rule's channel. Test messages never ping anyone.</p>
       {% endif %}
     </section>
 

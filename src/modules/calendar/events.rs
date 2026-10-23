@@ -67,15 +67,15 @@ impl Event {
         })
     }
 
-    /// A made-up event for previews and tests when the list has nothing upcoming.
-    pub fn sample(now: i64) -> Self {
+    /// A made-up event at `at` for previews and tests when the list has nothing upcoming.
+    pub fn sample(at: i64) -> Self {
         Self {
             task_id: "sample".into(),
             name: "Weekly sync".into(),
             url: "https://app.clickup.com/".into(),
-            at: now + 3600,
+            at,
             start: None,
-            due: Some(now + 3600),
+            due: Some(at),
             assignees: Vec::new(),
             description: "Agenda: status updates, blockers, next steps.".into(),
             status: "to do".into(),

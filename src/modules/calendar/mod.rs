@@ -22,6 +22,8 @@ use crate::state::{AppState, DiscordHandle};
 pub const ID: &str = "calendar";
 pub const MAX_RULES: i64 = 20;
 pub const MAX_TEMPLATE_LEN: usize = 1500;
+/// Upper bound of a digest's window offset, 7 days.
+pub const MAX_OFFSET_MINUTES: u32 = 10080;
 /// How long individual log rows are kept. Totals live in `module_stats`.
 pub const LOG_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 /// Sent-reminder markers are kept this long after the event.
@@ -251,6 +253,8 @@ pub struct Rule {
     /// IANA time zone of the digest schedule.
     pub timezone: String,
     pub lookahead_hours: u32,
+    /// Minutes after the scheduled time where a digest's event window starts.
+    pub offset_minutes: u32,
     pub lead_minutes: u32,
     pub layout: Layout,
     pub max_events: u32,
@@ -284,6 +288,7 @@ impl Rule {
             time_of_day: 9 * 60,
             timezone: "UTC".into(),
             lookahead_hours: 24,
+            offset_minutes: 0,
             lead_minutes: 15,
             layout: Layout::Combined,
             max_events: 15,
@@ -309,21 +314,38 @@ impl Rule {
     /// How far ahead this rule needs events, in seconds.
     pub fn horizon_secs(&self) -> i64 {
         match self.kind {
-            Kind::Digest => i64::from(self.lookahead_hours) * 3600,
+            Kind::Digest => {
+                i64::from(self.offset_minutes) * 60 + i64::from(self.lookahead_hours) * 3600
+            }
             Kind::Reminder => i64::from(self.lead_minutes) * 60 + 600,
         }
+    }
+
+    /// The events a digest posted for the scheduled time `anchor` lists: `start <= at < end`.
+    pub fn digest_window(&self, anchor: i64) -> (i64, i64) {
+        let start = anchor + i64::from(self.offset_minutes) * 60;
+        (start, start + i64::from(self.lookahead_hours) * 3600)
     }
 
     /// Short description for the rules table.
     pub fn schedule_text(&self) -> String {
         match self.kind {
-            Kind::Digest => format!(
-                "{} at {} {}, events of the next {} h",
-                schedule::describe_days(self.days),
-                schedule::fmt_minute(self.time_of_day),
-                self.timezone,
-                self.lookahead_hours
-            ),
+            Kind::Digest => {
+                let mut text = format!(
+                    "{} at {} {}, events of the next {} h",
+                    schedule::describe_days(self.days),
+                    schedule::fmt_minute(self.time_of_day),
+                    self.timezone,
+                    self.lookahead_hours
+                );
+                if self.offset_minutes > 0 {
+                    text.push_str(&format!(
+                        ", starting {} after",
+                        schedule::describe_lead(self.offset_minutes)
+                    ));
+                }
+                text
+            }
             Kind::Reminder => format!(
                 "{} before each event",
                 schedule::describe_lead(self.lead_minutes)
@@ -343,6 +365,7 @@ struct RuleRow {
     time_of_day: i64,
     timezone: String,
     lookahead_hours: i64,
+    offset_minutes: i64,
     lead_minutes: i64,
     layout: String,
     max_events: i64,
@@ -371,6 +394,7 @@ impl From<RuleRow> for Rule {
             time_of_day: r.time_of_day.clamp(0, 1439) as u16,
             timezone: r.timezone,
             lookahead_hours: r.lookahead_hours.clamp(1, 336) as u32,
+            offset_minutes: r.offset_minutes.clamp(0, i64::from(MAX_OFFSET_MINUTES)) as u32,
             lead_minutes: r.lead_minutes.clamp(1, 10080) as u32,
             layout: if r.layout == "per_event" {
                 Layout::PerEvent
@@ -394,7 +418,7 @@ impl From<RuleRow> for Rule {
 }
 
 const RULE_COLUMNS: &str = "id, name, enabled, kind, channel_id, days, time_of_day, timezone, \
-    lookahead_hours, lead_minutes, layout, max_events, post_when_empty, header_template, \
+    lookahead_hours, offset_minutes, lead_minutes, layout, max_events, post_when_empty, header_template, \
     item_template, empty_template, mention_assignees, mention_roles, use_embed, embed_color, \
     description_max, reactions, last_run_at";
 
@@ -436,11 +460,11 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     let res = sqlx::query(
         "INSERT INTO calendar_rules
              (guild_id, name, enabled, kind, channel_id, days, time_of_day, timezone,
-              lookahead_hours, lead_minutes, layout, max_events, post_when_empty,
-              header_template, item_template, empty_template, mention_assignees, mention_roles,
-              use_embed, embed_color, description_max, reactions, last_run_at, created_at,
-              updated_at, updated_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              lookahead_hours, offset_minutes, lead_minutes, layout, max_events,
+              post_when_empty, header_template, item_template, empty_template,
+              mention_assignees, mention_roles, use_embed, embed_color, description_max,
+              reactions, last_run_at, created_at, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(sf(guild_id))
     .bind(rule.name.clone())
@@ -451,6 +475,7 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(i64::from(rule.time_of_day))
     .bind(rule.timezone.clone())
     .bind(i64::from(rule.lookahead_hours))
+    .bind(i64::from(rule.offset_minutes))
     .bind(i64::from(rule.lead_minutes))
     .bind(layout_str(rule.layout))
     .bind(i64::from(rule.max_events))
@@ -479,7 +504,8 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     sqlx::query(
         "UPDATE calendar_rules SET
              name = ?, enabled = ?, channel_id = ?, days = ?, time_of_day = ?, timezone = ?,
-             lookahead_hours = ?, lead_minutes = ?, layout = ?, max_events = ?,
+             lookahead_hours = ?, offset_minutes = ?, lead_minutes = ?, layout = ?,
+             max_events = ?,
              post_when_empty = ?, header_template = ?, item_template = ?, empty_template = ?,
              mention_assignees = ?, mention_roles = ?, use_embed = ?, embed_color = ?,
              description_max = ?, reactions = ?, last_run_at = ?, updated_at = ?,
@@ -493,6 +519,7 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(i64::from(rule.time_of_day))
     .bind(rule.timezone.clone())
     .bind(i64::from(rule.lookahead_hours))
+    .bind(i64::from(rule.offset_minutes))
     .bind(i64::from(rule.lead_minutes))
     .bind(layout_str(rule.layout))
     .bind(i64::from(rule.max_events))
@@ -653,6 +680,30 @@ mod tests {
         assert!(parse_tags(&"x".repeat(51)).is_none());
     }
 
+    #[test]
+    fn digest_windows() {
+        let mut rule = Rule::new(Kind::Digest);
+        rule.time_of_day = 20 * 60;
+        rule.lookahead_hours = 24;
+        assert_eq!(rule.digest_window(1000), (1000, 1000 + 86400));
+        assert_eq!(rule.horizon_secs(), 86400);
+        assert_eq!(
+            rule.schedule_text(),
+            "Every day at 20:00 UTC, events of the next 24 h"
+        );
+
+        rule.offset_minutes = 240;
+        assert_eq!(
+            rule.digest_window(1000),
+            (1000 + 14400, 1000 + 14400 + 86400)
+        );
+        assert_eq!(rule.horizon_secs(), 14400 + 86400);
+        assert_eq!(
+            rule.schedule_text(),
+            "Every day at 20:00 UTC, events of the next 24 h, starting 4 hours after"
+        );
+    }
+
     #[tokio::test]
     async fn config_defaults_and_round_trip() {
         let db = test_util::pool().await;
@@ -704,6 +755,7 @@ mod tests {
         let mut edited = loaded.clone();
         edited.name = "Standup ping".into();
         edited.lead_minutes = 60;
+        edited.offset_minutes = 240;
         edited.timezone = "Europe/Warsaw".into();
         edited.mention_roles = true;
         update_rule(&db, 1, &edited, "alice").await.unwrap();
@@ -713,6 +765,7 @@ mod tests {
         let loaded = load_rule(&db, 1, id).await.unwrap().unwrap();
         assert_eq!(loaded.name, "Standup ping");
         assert_eq!(loaded.lead_minutes, 60);
+        assert_eq!(loaded.offset_minutes, 240);
         assert_eq!(loaded.tz().iana_name(), Some("Europe/Warsaw"));
         assert!(loaded.mention_roles);
 

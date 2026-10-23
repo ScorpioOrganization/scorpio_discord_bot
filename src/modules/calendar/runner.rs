@@ -165,6 +165,15 @@ async fn resolver_for(state: &AppState, guild_id: u64, events: &[Event]) -> Resu
     clickup::resolver(state, guild_id, &people).await
 }
 
+/// The events of a digest window, `from <= at < to`.
+fn in_window(events: &[Event], from: i64, to: i64) -> Vec<Event> {
+    events
+        .iter()
+        .filter(|e| (from..to).contains(&e.at))
+        .cloned()
+        .collect()
+}
+
 /// Posts every digest and reminder that is due at `now`.
 pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox) -> Result<()> {
     let cfg = load_config(&state.db, guild_id).await?;
@@ -233,13 +242,13 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
         resolver: &resolver,
         tag_roles: &tag_roles,
         list_name: &list_name,
-        now,
     };
 
     for (rule, occurrence) in due_digests {
-        let until = now + i64::from(rule.lookahead_hours) * 3600;
-        let window: Vec<Event> = upcoming.iter().filter(|e| e.at <= until).cloned().collect();
-        let msgs = render::digest_messages(rule, &window, &ctx);
+        // Counted from the scheduled time, so a late post lists the same events.
+        let (from, to) = rule.digest_window(occurrence);
+        let window = in_window(&upcoming, from, to);
+        let msgs = render::digest_messages(rule, &window, from, &ctx);
         let channel = rule.channel_id.unwrap_or_default();
         let out = post_all(outbox, channel, &msgs).await;
         // Marked handled even when Discord refused, so a broken channel is not retried
@@ -287,9 +296,10 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
     Ok(())
 }
 
-/// Messages a rule would post right now: a digest of the current window (posted even when
-/// empty), or a reminder for the next event. When ClickUp cannot be read, a sample event is
-/// used and the error is returned next to the messages.
+/// Messages of a rule's next post with the events known now: a digest of the window of its
+/// next scheduled time (posted even when empty), or a reminder for the next event. When
+/// ClickUp cannot be read, a sample event is used and the error is returned next to the
+/// messages.
 pub async fn sample_messages(
     state: &AppState,
     guild_id: u64,
@@ -297,19 +307,22 @@ pub async fn sample_messages(
     now: i64,
 ) -> Result<(Vec<OutMessage>, Option<FetchError>)> {
     let cfg = load_config(&state.db, guild_id).await?;
-    let (upcoming, error) = match events::cached(
-        state,
-        guild_id,
-        &cfg,
-        now,
-        rule.horizon_secs(),
-        events::MAX_AGE,
-    )
-    .await?
-    {
-        Ok(f) => (f.between(now, i64::MAX), None),
-        Err(e) => (vec![Event::sample(now)], Some(e)),
+    let (from, to) = match rule.kind {
+        Kind::Digest => rule.digest_window(
+            schedule::next_occurrence(now, rule.days, rule.time_of_day, &rule.tz()).unwrap_or(now),
+        ),
+        Kind::Reminder => (now, now + rule.horizon_secs()),
     };
+    // Inside the window of a digest, so the preview is not empty.
+    let sample = Event::sample(match rule.kind {
+        Kind::Digest => from + (to - from) / 2,
+        Kind::Reminder => now + 3600,
+    });
+    let (upcoming, error) =
+        match events::cached(state, guild_id, &cfg, now, to - now, events::MAX_AGE).await? {
+            Ok(f) => (f.between(now, i64::MAX), None),
+            Err(e) => (vec![sample.clone()], Some(e)),
+        };
     let resolver = resolver_for(state, guild_id, &upcoming).await?;
     let tag_roles = clickup::tag_roles(state, guild_id).await?;
     let list_name = cfg.list_name.clone().unwrap_or_else(|| "Calendar".into());
@@ -317,21 +330,16 @@ pub async fn sample_messages(
         resolver: &resolver,
         tag_roles: &tag_roles,
         list_name: &list_name,
-        now,
     };
     let msgs = match rule.kind {
         Kind::Digest => {
-            let until = now + i64::from(rule.lookahead_hours) * 3600;
-            let window: Vec<Event> = upcoming.into_iter().filter(|e| e.at <= until).collect();
+            let window = in_window(&upcoming, from, to);
             let mut always = rule.clone();
             always.post_when_empty = true;
-            render::digest_messages(&always, &window, &ctx)
+            render::digest_messages(&always, &window, from, &ctx)
         }
         Kind::Reminder => {
-            let ev = upcoming
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| Event::sample(now));
+            let ev = upcoming.into_iter().next().unwrap_or(sample);
             vec![render::event_message(rule, &ev, &ctx)]
         }
     };
@@ -354,8 +362,8 @@ fn message_text(msg: &OutMessage) -> String {
     text
 }
 
-/// Readable text of the first messages a rule would post, for the dashboard. Digest times
-/// are shown in the rule's time zone, reminder times in the server default.
+/// Readable text of the first messages of a rule's next post, for the dashboard. Digest
+/// times are shown in the rule's time zone, reminder times in the server default.
 pub async fn preview(state: &AppState, guild_id: u64, rule: &Rule, now: i64) -> Result<String> {
     let (msgs, _) = sample_messages(state, guild_id, rule, now).await?;
     if msgs.is_empty() {
@@ -391,8 +399,8 @@ pub enum TestOutcome {
     Fetch(FetchError),
 }
 
-/// Posts what the rule would post now, without pings, counting it or changing any schedule
-/// state.
+/// Posts what the rule's next post would look like (see [`sample_messages`]), without pings,
+/// counting it or changing any schedule state.
 pub async fn send_test(
     state: &AppState,
     guild_id: u64,
@@ -620,6 +628,51 @@ pub mod tests {
         assert_eq!(s.outbox.take().len(), 1);
         run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "09:00 UTC is not the schedule");
+    }
+
+    #[tokio::test]
+    async fn digest_offset_lists_only_the_shifted_window() {
+        let s = setup().await;
+        let midnight = NINE + 15 * 3600;
+        s.mock.set_tasks(
+            mock::LIST_ID,
+            vec![
+                task_at("a", "Tonight", NINE + 12 * 3600),
+                task_at("b", "Midnight", midnight),
+                task_at("c", "Afternoon", NINE + 30 * 3600),
+                task_at("d", "Saturday", midnight + 86400),
+            ],
+        );
+        // Posted at 20:00, lists the next day: 00:00 Friday up to 00:00 Saturday.
+        let mut rule = digest();
+        rule.time_of_day = 20 * 60;
+        rule.offset_minutes = 240;
+        rule.lookahead_hours = 24;
+        rule.header_template = "**{date}** ({count})".into();
+        let rule = add_rule(&s, &rule).await;
+
+        // The preview at 14:00 already shows the window of the 20:00 post.
+        let text = preview(&s.state, GUILD_ID, &rule, NINE + 5 * 3600)
+            .await
+            .unwrap();
+        assert!(text.starts_with("**2026-10-16** (2)"), "{text}");
+        assert!(text.contains("Midnight") && text.contains("Afternoon"));
+        assert!(!text.contains("Tonight") && !text.contains("Saturday"));
+
+        run(&s.state, GUILD_ID, NINE + 11 * 3600 + 30, &s.outbox)
+            .await
+            .unwrap();
+        let posts = s.outbox.take();
+        assert_eq!(posts.len(), 1);
+        let msg = &posts[0].1.content;
+        assert!(
+            msg.starts_with(&format!("**<t:{midnight}:D>** (2)")),
+            "{msg}"
+        );
+        let first = msg.find("Midnight").unwrap();
+        assert!(first < msg.find("Afternoon").unwrap());
+        assert!(!msg.contains("Tonight"), "before the window");
+        assert!(!msg.contains("Saturday"), "the window end is excluded");
     }
 
     #[tokio::test]

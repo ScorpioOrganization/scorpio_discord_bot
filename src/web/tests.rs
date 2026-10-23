@@ -896,6 +896,7 @@ fn digest_form(csrf: &str) -> Vec<(&'static str, String)> {
         ("day", "4".into()),
         ("time", "08:30".into()),
         ("lookahead_hours", "24".into()),
+        ("offset_minutes", "240".into()),
         ("layout", "combined".into()),
         ("max_events", "10".into()),
         ("header_template", "**Today** ({count})".into()),
@@ -1177,6 +1178,9 @@ async fn calendar_rule_create_validate_edit_delete() {
         ("day", None, "rule_no_days"),
         ("time", Some("25:00"), "rule_time"),
         ("lookahead_hours", Some("0"), "rule_lookahead"),
+        ("offset_minutes", Some("10081"), "rule_offset"),
+        ("offset_minutes", Some("-5"), "rule_offset"),
+        ("offset_minutes", Some("4h"), "rule_offset"),
         ("max_events", Some("51"), "rule_max_events"),
         ("item_template", Some("  "), "template_empty"),
         ("header_template", Some(long.as_str()), "template_long"),
@@ -1217,6 +1221,7 @@ async fn calendar_rule_create_validate_edit_delete() {
     assert_eq!(rule.channel_id, Some(CHANNEL_ID));
     assert_eq!(rule.reactions.len(), 2);
     assert_eq!(rule.timezone, "Europe/Warsaw");
+    assert_eq!(rule.offset_minutes, 240);
     assert!(rule.enabled && !rule.mention_assignees && !rule.mention_roles);
     assert_eq!(
         location,
@@ -1242,6 +1247,7 @@ async fn calendar_rule_create_validate_edit_delete() {
     let edit = with_field(&edit, "mention_roles", Some("on"));
     let edit = with_field(&edit, "header_template", Some("  "));
     let edit = with_field(&edit, "timezone", Some(" America/New_York "));
+    let edit = with_field(&edit, "offset_minutes", None);
     let path = calendar_path(&format!("/rules/{}", rule.id));
     let res = post_owned(&app, &path, &cookie, &edit).await;
     assert_eq!(res.redirect(), format!("{path}?msg=saved"));
@@ -1254,6 +1260,7 @@ async fn calendar_rule_create_validate_edit_delete() {
     assert!(saved.mention_assignees && saved.mention_roles);
     assert_eq!(saved.header_template, "", "the header is optional");
     assert_eq!(saved.timezone, "America/New_York");
+    assert_eq!(saved.offset_minutes, 0, "no offset when left out");
 
     // Role pings without a {roles} placeholder or a mapped tag are pointed out.
     let page = app.get(&path, Some(&cookie)).await;

@@ -49,7 +49,7 @@ pub const ITEM_PLACEHOLDERS: &[(&str, &str)] = &[
 pub const HEADER_PLACEHOLDERS: &[(&str, &str)] = &[
     ("{count}", "Number of events"),
     ("{list}", "ClickUp list name"),
-    ("{date}", "Today's date"),
+    ("{date}", "Date the listed events start from"),
     ("{roles}", "Roles of the listed events, as mentions"),
 ];
 
@@ -58,7 +58,6 @@ pub struct Ctx<'a> {
     /// Lowercase ClickUp tag to Discord role.
     pub tag_roles: &'a HashMap<String, u64>,
     pub list_name: &'a str,
-    pub now: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,11 +209,12 @@ fn event_text(
 }
 
 /// Header and empty message text. `count` is the number of events in the window, `listed`
-/// the ones the digest shows.
+/// the ones the digest shows, `from` the start of the window.
 fn header_text(
     template: &str,
     count: usize,
     listed: &[Event],
+    from: i64,
     ctx: &Ctx,
     mentioned: &mut Mentions,
 ) -> String {
@@ -222,21 +222,22 @@ fn header_text(
         Some(match token {
             "count" => count.to_string(),
             "list" => escape_markdown(ctx.list_name),
-            "date" => stamp(ctx.now, 'D'),
+            "date" => stamp(from, 'D'),
             "roles" => role_mentions(tag_roles(listed, ctx), mentioned),
             _ => return None,
         })
     })
 }
 
-/// Messages for a digest of `events` (already limited to the rule's window).
-pub fn digest_messages(rule: &Rule, events: &[Event], ctx: &Ctx) -> Vec<OutMessage> {
+/// Messages for a digest of `events` (already limited to the rule's window, which starts at
+/// `from`).
+pub fn digest_messages(rule: &Rule, events: &[Event], from: i64, ctx: &Ctx) -> Vec<OutMessage> {
     if events.is_empty() {
         if !rule.post_when_empty {
             return Vec::new();
         }
         let mut mentioned = Mentions::default();
-        let text = header_text(&rule.empty_template, 0, &[], ctx, &mut mentioned);
+        let text = header_text(&rule.empty_template, 0, &[], from, ctx, &mut mentioned);
         return vec![finish(rule, text, None, mentioned)];
     }
     let listed = &events[..events.len().min(rule.max_events as usize)];
@@ -250,6 +251,7 @@ pub fn digest_messages(rule: &Rule, events: &[Event], ctx: &Ctx) -> Vec<OutMessa
                 &rule.header_template,
                 events.len(),
                 listed,
+                from,
                 ctx,
                 &mut mentioned,
             );
@@ -261,7 +263,7 @@ pub fn digest_messages(rule: &Rule, events: &[Event], ctx: &Ctx) -> Vec<OutMessa
             msgs.extend(listed.iter().map(|e| event_message(rule, e, ctx)));
             msgs
         }
-        Layout::Combined => vec![combined(rule, events, ctx)],
+        Layout::Combined => vec![combined(rule, events, from, ctx)],
     }
 }
 
@@ -276,7 +278,7 @@ fn more_line(n: usize) -> String {
     format!("...and {n} more.")
 }
 
-fn combined(rule: &Rule, events: &[Event], ctx: &Ctx) -> OutMessage {
+fn combined(rule: &Rule, events: &[Event], from: i64, ctx: &Ctx) -> OutMessage {
     let limit = if rule.use_embed {
         EMBED_DESCRIPTION_MAX
     } else {
@@ -301,6 +303,7 @@ fn combined(rule: &Rule, events: &[Event], ctx: &Ctx) -> OutMessage {
         &rule.header_template,
         events.len(),
         &events[..shown],
+        from,
         ctx,
         &mut mentioned,
     );
@@ -549,7 +552,6 @@ mod tests {
             resolver: &r,
             tag_roles: &tags,
             list_name: "Events / Calendar",
-            now: NOW,
         })
     }
 
@@ -667,7 +669,7 @@ mod tests {
             .collect();
         events[0].tags = vec!["meeting".into()];
         events[1].tags = vec!["team".into(), "meeting".into()];
-        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events, NOW, ctx));
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "**2 events** <@&500> <@&501>");
         assert_eq!(msgs[0].mention_roles, [MEETING_ROLE, TEAM_ROLE]);
@@ -678,18 +680,18 @@ mod tests {
 
         // An empty header means no header message, in both layouts.
         rule.header_template = String::new();
-        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events, NOW, ctx));
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "E0");
         rule.layout = Layout::Combined;
-        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events, NOW, ctx));
         assert_eq!(msgs[0].content, "E0\nE1");
 
         // A header whose placeholders are all empty is not sent either.
         rule.layout = Layout::PerEvent;
         rule.header_template = "{roles}".into();
         events.iter_mut().for_each(|e| e.tags.clear());
-        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events, NOW, ctx));
         assert_eq!(msgs.len(), 2);
     }
 
@@ -714,7 +716,7 @@ mod tests {
         let events: Vec<Event> = (0..3)
             .map(|i| event(&i.to_string(), &format!("E{i}"), NOW + i))
             .collect();
-        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events, NOW, ctx));
         assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0].content,
@@ -728,13 +730,13 @@ mod tests {
 
         // Multi-line items get a blank line between them.
         rule.item_template = "{title}\n{time}".into();
-        let msgs = with(|ctx| digest_messages(&rule, &events[..2], ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events[..2], NOW, ctx));
         assert!(msgs[0].content.contains("\n\nE1"));
 
         // max_events and the message size limit both end with a "more" line.
         rule.item_template = "{title} {description}".into();
         rule.max_events = 2;
-        let msgs = with(|ctx| digest_messages(&rule, &events, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &events, NOW, ctx));
         assert!(msgs[0].content.ends_with("...and 1 more."));
         assert!(!msgs[0].content.contains("E2"));
 
@@ -747,12 +749,12 @@ mod tests {
                 e
             })
             .collect();
-        let msgs = with(|ctx| digest_messages(&rule, &long, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &long, NOW, ctx));
         let content = &msgs[0].content;
         assert!(content.chars().count() <= CONTENT_MAX);
         assert!(content.ends_with("more."), "{content}");
         rule.use_embed = true;
-        let msgs = with(|ctx| digest_messages(&rule, &long, ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &long, NOW, ctx));
         let embed = msgs[0].embed.as_ref().unwrap();
         assert!(embed.description.chars().count() <= EMBED_DESCRIPTION_MAX);
         assert!(embed.description.chars().count() > CONTENT_MAX);
@@ -768,16 +770,22 @@ mod tests {
             .map(|i| event(&i.to_string(), "E", NOW + i))
             .collect();
         assert_eq!(
-            with(|ctx| digest_messages(&rule, &events, ctx)).len(),
+            with(|ctx| digest_messages(&rule, &events, NOW, ctx)).len(),
             3,
             "the header and max_events events"
         );
 
-        assert!(with(|ctx| digest_messages(&rule, &[], ctx)).is_empty());
+        assert!(with(|ctx| digest_messages(&rule, &[], NOW, ctx)).is_empty());
         rule.post_when_empty = true;
         rule.empty_template = "Nothing on {list} ({count})".into();
-        let msgs = with(|ctx| digest_messages(&rule, &[], ctx));
+        let msgs = with(|ctx| digest_messages(&rule, &[], NOW, ctx));
         assert_eq!(msgs[0].content, "Nothing on Events / Calendar (0)");
+
+        // {date} is the day the window starts, not the day of posting.
+        rule.empty_template = "Nothing on {date}".into();
+        let tomorrow = NOW + 86400;
+        let msgs = with(|ctx| digest_messages(&rule, &[], tomorrow, ctx));
+        assert_eq!(msgs[0].content, format!("Nothing on <t:{tomorrow}:D>"));
     }
 
     #[test]

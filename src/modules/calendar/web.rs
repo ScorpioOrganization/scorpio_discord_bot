@@ -16,9 +16,9 @@ use super::render::{HEADER_PLACEHOLDERS, ITEM_PLACEHOLDERS};
 use super::runner::{self, DiscordOutbox, TestOutcome};
 use super::schedule::{self, DAY_NAMES};
 use super::{
-    CalendarConfig, ID, Kind, Layout, LogRow, MAX_RULES, MAX_TEMPLATE_LEN, Rule, count_rules,
-    delete_rule, insert_rule, list_rules, load_config, load_rule, parse_tags, recent_log,
-    save_config, update_rule, was_sent,
+    CalendarConfig, ID, Kind, Layout, LogRow, MAX_OFFSET_MINUTES, MAX_RULES, MAX_TEMPLATE_LEN,
+    Rule, count_rules, delete_rule, insert_rule, list_rules, load_config, load_rule, parse_tags,
+    recent_log, save_config, update_rule, was_sent,
 };
 use crate::auth::extract::CurrentUser;
 use crate::bot::info::{self, ChannelOption, GuildSummary, RoleOption};
@@ -871,6 +871,11 @@ fn parse_rule_form(
             rule.timezone =
                 schedule::tz_name(get("timezone").unwrap_or_default()).ok_or("timezone_invalid")?;
             rule.lookahead_hours = number(get("lookahead_hours"), 1..=336, "rule_lookahead")?;
+            // Left empty means no offset.
+            rule.offset_minutes = match get("offset_minutes").map(str::trim) {
+                None | Some("") => 0,
+                raw => number(raw, 0..=MAX_OFFSET_MINUTES, "rule_offset")?,
+            };
             rule.layout = if get("layout") == Some("per_event") {
                 Layout::PerEvent
             } else {

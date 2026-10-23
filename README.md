@@ -143,7 +143,7 @@ Configured per server under **Overview > server > Calendar**. The bot reads one 
 
 **Rules** (up to 20 per server), each with its own channel:
 
-- **Digest**: on the chosen weekdays at a time of day in the rule's own time zone, posts the events of the next N hours, either as one message listing them or as one message per event. The optional header starts the listing message, or is posted as its own first message in the one message per event layout. Optionally posts a message when there are no events. A new digest rule takes the time zone of your browser (or the server default without JavaScript).
+- **Digest**: on the chosen weekdays at a time of day in the rule's own time zone, posts the events of the next N hours, either as one message listing them or as one message per event. The optional header starts the listing message, or is posted as its own first message in the one message per event layout. The window can start a number of minutes after the scheduled time: posting at 20:00, skipping 240 minutes and including 24 hours lists the events of the next day (00:00 to 24:00). Optionally posts a message when there are no events. A new digest rule takes the time zone of your browser (or the server default without JavaScript).
 - **Reminder**: posts once for every event, a set number of minutes before it starts. If the event is moved, it is reminded again before the new time.
 
 Every rule has a message template, a description length, an embed option with color, up to 5 reactions the bot adds to its messages (any emoji, or custom emojis of the server), whether matched assignees are pinged, and whether roles mapped from task tags are pinged.
@@ -163,7 +163,7 @@ Placeholders for each event:
 | `{status}`, `{tags}`, `{priority}`, `{list}` | task status, tags, priority and list name |
 | `{roles}` | roles mapped from the task's tags (ClickUp page), as role mentions |
 
-The digest header and the "no events" message know `{count}`, `{list}`, `{date}` and `{roles}` (the roles of all listed events). Times are Discord timestamps, so every reader sees them in their own time zone. A template line whose placeholders all come out empty is left out.
+The digest header and the "no events" message know `{count}`, `{list}`, `{date}` (the day the listed events start from) and `{roles}` (the roles of all listed events). Times are Discord timestamps, so every reader sees them in their own time zone. A template line whose placeholders all come out empty is left out.
 
 Behavior worth knowing:
 
@@ -174,7 +174,7 @@ Behavior worth knowing:
 - While a reminder rule exists the bot reads the list about once a minute, so new or moved tasks are noticed within a minute. A task created after its reminder time but before it starts is reminded right away; one that already started is not.
 - Reminders need a due time. A ClickUp date without a time is stored as 04:00, see Troubleshooting.
 - Tasks are read in pages; if a list has more than about 500 matching tasks in the time window, some can be missed and the page says so. A tag filter helps.
-- The page shows the upcoming events of the next 7 days with matched members, each rule's next run, statistics (digests, reminders, failed posts, missed digests, ClickUp errors) and recent activity. The rule page shows a preview of what would be posted now and has a **Send test message** button.
+- The page shows the upcoming events of the next 7 days with matched members, each rule's next run, statistics (digests, reminders, failed posts, missed digests, ClickUp errors) and recent activity. The rule page shows a preview of the rule's next post (for a digest, the window of its next scheduled time) and has a **Send test message** button that posts it.
 
 ## Security notes
 

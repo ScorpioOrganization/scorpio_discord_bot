@@ -242,6 +242,10 @@ impl Flash {
             "rule_no_days" => (false, "Pick at least one day."),
             "rule_time" => (false, "The time must look like 09:00."),
             "rule_lookahead" => (false, "Look ahead between 1 and 336 hours."),
+            "rule_offset" => (
+                false,
+                "Start the window between 0 and 10080 minutes (7 days) after the post.",
+            ),
             "rule_lead" => (
                 false,
                 "Remind between 1 minute and 7 days (10080 minutes) before.",
