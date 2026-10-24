@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}New rule{% else %}{{ rule.name }}{% endif %} | Recurring tasks{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}/modules/recurring">Recurring tasks</a><span>/</span>
+  <span>{% if is_new %}New rule{% else %}{{ rule.name }}{% endif %}</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>{% if is_new %}New rule{% else %}{{ rule.name }}{% endif %}</h1>
+    <p class="muted">Tasks with the tag recur at the interval below.</p>
+  </div>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/recurring/rules{% if !is_new %}/{{ rule.id }}{% endif %}">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+
+    <label>
+      <span>Name</span>
+      <input type="text" name="name" value="{{ rule.name }}" maxlength="60" required>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="enabled"{% if rule.enabled %} checked{% endif %}>
+      <span>Rule is active</span>
+    </label>
+    <label>
+      <span>ClickUp tag</span>
+      <input type="text" name="tag" value="{{ rule.tag }}" list="workspace-tags" maxlength="100" placeholder="weekly" required autocomplete="off">
+    </label>
+    <datalist id="workspace-tags">
+      {% for t in tags %}<option value="{{ t }}">{% endfor %}
+    </datalist>
+    {% if let Some(err) = tags_error %}
+    <p class="hint text-err">Could not load the workspace's tags: {{ err }}</p>
+    {% endif %}
+    <p class="hint">Tags are matched ignoring case. Each tag can belong to one rule.</p>
+
+    <fieldset class="field-group">
+      <legend>Repeat every</legend>
+      <div class="actions">
+        <input type="number" name="every" value="{{ rule.every }}" min="1" max="365" required aria-label="Number of units">
+        <select name="unit" aria-label="Unit">
+          {% for u in units %}
+          <option value="{{ u.value }}"{% if u.selected %} selected{% endif %}>{{ u.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </fieldset>
+
+    <fieldset class="field-group">
+      <legend>Recur</legend>
+      <label class="check">
+        <input type="radio" name="trigger" value="close"{% if on_close %} checked{% endif %}>
+        <span>When done: the task is in a done or closed status</span>
+      </label>
+      <label class="check">
+        <input type="radio" name="trigger" value="schedule"{% if !on_close %} checked{% endif %}>
+        <span>When due: the due date passed, done or not</span>
+      </label>
+    </fieldset>
+
+    <fieldset class="field-group">
+      <legend>Then</legend>
+      <label class="check">
+        <input type="radio" name="mode" value="update"{% if !copies %} checked{% endif %}>
+        <span>Move the task to its next date</span>
+      </label>
+      <label class="check">
+        <input type="radio" name="mode" value="create"{% if copies %} checked{% endif %}>
+        <span>Keep the task and create a copy at the next date</span>
+      </label>
+    </fieldset>
+
+    <label>
+      <span>Status after recurring (optional)</span>
+      <input type="text" name="reopen_status" value="{{ rule.reopen_status }}" maxlength="60" placeholder="first open status of the list" autocomplete="off">
+    </label>
+    <p class="hint">Empty means the first open status of the task's list, like "to do". A name must exist in every list the tagged tasks are in.</p>
+    <label class="check">
+      <input type="checkbox" name="shift_start"{% if rule.shift_start %} checked{% endif %}>
+      <span>Move the start date too</span>
+    </label>
+
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">{% if is_new %}Create rule{% else %}Save rule{% endif %}</button>
+      <a class="btn btn-ghost" href="/guilds/{{ guild.id }}/modules/recurring">Back</a>
+    </div>
+  </form>
+
+  <div class="stack">
+    <section class="card">
+      <h2>{% if is_new %}Example{% else %}This rule{% endif %}</h2>
+      <p>{{ example }}</p>
+      <p class="hint">Occurrences missed while nothing ran are skipped: the next due date is always the first one after now. Month steps keep the day of the month where it exists, the 31st becomes the last day of shorter months.</p>
+      {% if copies %}
+      <p class="hint">Copies get the name, description, tags, assignees and priority. Checklists, subtasks, custom fields and attachments are not copied. Only tasks due in the last 60 days are copied.</p>
+      {% endif %}
+    </section>
+
+    {% if !is_new %}
+    <form method="post" action="/guilds/{{ guild.id }}/modules/recurring/rules/{{ rule.id }}/delete" class="actions" data-confirm="Delete this rule? Tasks with its tag stop recurring.">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-danger" type="submit">Delete rule</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

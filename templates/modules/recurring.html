@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+{% block title %}Recurring tasks | {{ guild.name }}{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <span>Recurring tasks</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>Recurring tasks</h1>
+    <p class="muted">Moves tagged ClickUp tasks to their next date when ClickUp's own recurrence does not. This module changes tasks in ClickUp.</p>
+  </div>
+  <form method="post" action="/guilds/{{ guild.id }}/modules/recurring/toggle" class="toggle-form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <input type="hidden" name="back" value="module">
+    {% if enabled %}
+    <span class="badge badge-on">Enabled</span>
+    <input type="hidden" name="enabled" value="0">
+    <button class="btn btn-ghost" type="submit">Disable</button>
+    {% else %}
+    <span class="badge badge-off">Disabled</span>
+    <input type="hidden" name="enabled" value="1">
+    <button class="btn btn-primary" type="submit">Enable</button>
+    {% endif %}
+  </form>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <div class="stack">
+    {% include "clickup/token_card.html" %}
+
+    <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/recurring">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <h2>Settings</h2>
+      {% if let Some(err) = team_error %}
+      <div class="callout callout-err small">Could not load your ClickUp workspaces: {{ err }}</div>
+      {% endif %}
+      <label>
+        <span>ClickUp workspace (searched for tagged tasks)</span>
+        <select name="team_id">
+          <option value="">{% if teams.is_empty() %}Save an API key to pick a workspace{% else %}None{% endif %}</option>
+          {% if team_outside_list %}
+          <option value="{{ team_id() }}" selected>{{ team_name() }}</option>
+          {% endif %}
+          {% for t in teams %}
+          <option value="{{ t.id }}"{% if t.selected %} selected{% endif %}>{{ t.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Time zone (intervals are counted in it, so 09:00 stays 09:00)</span>
+        <input type="text" name="timezone" id="recurring-tz" value="{{ cfg.timezone }}" list="time-zones" required autocomplete="off">
+      </label>
+      <datalist id="time-zones">
+        {% for name in tz_names %}<option value="{{ name }}">{% endfor %}
+      </datalist>
+      <div class="chips">
+        <button type="button" class="chip" data-local-tz="recurring-tz" hidden>Use my time zone</button>
+      </div>
+      <p class="hint">Use the time zone your team works in. ClickUp stores a date without a time as 04:00 in the time zone of whoever set it; copies of such tasks get a date without a time.</p>
+      <label class="inline-field">
+        <span>Check every (minutes)</span>
+        <input type="number" name="check_minutes" value="{{ cfg.check_minutes }}" min="{{ check_min }}" max="{{ check_max }}" required>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="dry_run"{% if cfg.dry_run %} checked{% endif %}>
+        <span>Dry run: only log what would change, never change ClickUp</span>
+      </label>
+      <div class="actions"><button class="btn btn-primary" type="submit">Save settings</button></div>
+    </form>
+
+    <section class="card">
+      <h2>How it works</h2>
+      <ul class="small">
+        <li>ClickUp's API does not show recurrence settings, so each rule here maps a ClickUp tag to an interval. Tag a task to make it recur, remove the tag to stop it.</li>
+        <li><strong>When done</strong>: a tagged task in a done or closed status recurs. <strong>When due</strong>: it recurs once its due date passes, whatever its status.</li>
+        <li>The next due date is the first one after now, a whole number of intervals after the old one, so missed occurrences are skipped and a task done early keeps its rhythm. The start date moves by the same amount.</li>
+        <li><strong>Move task</strong> changes the task's dates and status. <strong>Copy task</strong> leaves it and creates a copy (name, description, tags, assignees, priority; not checklists, subtasks, custom fields or attachments), only for tasks due in the last 60 days.</li>
+        <li>Remove ClickUp's own recurrence from tagged tasks, or a task can be moved twice.</li>
+        <li>At most {{ max_writes }} tasks change per run, every occurrence only once. Scheduled runs need the bot online; Run now always works.</li>
+      </ul>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section class="card">
+      <div class="label-row">
+        <h2>Rules</h2>
+      </div>
+      {% if rules.is_empty() %}
+      <p class="muted">No rules yet. A rule picks a tag, an interval, when tasks recur and what happens to them.</p>
+      {% else %}
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Rule</th><th>Tag</th><th>Interval</th></tr></thead>
+          <tbody>
+          {% for r in rules %}
+          <tr>
+            <td>
+              <a href="/guilds/{{ guild.id }}/modules/recurring/rules/{{ r.id }}">{{ r.name }}</a>
+              {% if !r.enabled %}<span class="badge badge-off">off</span>{% endif %}
+            </td>
+            <td><code>{{ r.tag }}</code></td>
+            <td class="small">{{ r.interval }}<br><span class="muted">{{ r.trigger }}, {{ r.mode }}</span></td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+      {% if can_add_rule %}
+      <div class="actions">
+        <a class="btn btn-secondary" href="/guilds/{{ guild.id }}/modules/recurring/rules/new">New rule</a>
+      </div>
+      {% else %}
+      <p class="hint">The maximum number of rules is reached.</p>
+      {% endif %}
+    </section>
+
+    <section class="stats-grid">
+      <div class="stat"><span class="stat-label">Tasks moved</span><span class="stat-value">{{ moved }}</span></div>
+      <div class="stat"><span class="stat-label">Tasks copied</span><span class="stat-value">{{ copied }}</span></div>
+      <div class="stat"><span class="stat-label">Failed</span><span class="stat-value{% if failed > 0 %} text-err{% endif %}">{{ failed }}</span></div>
+      <div class="stat"><span class="stat-label">ClickUp errors</span><span class="stat-value{% if api_err > 0 %} text-err{% endif %}">{{ api_err }}</span></div>
+    </section>
+
+    <section class="card">
+      <dl class="kv">
+        <div><dt>Last run</dt><dd>{% if last_run_ts > 0 %}<time data-ts="{{ last_run_ts }}">{{ last_run }}</time>{% else %}{{ last_run }}{% endif %}</dd></div>
+        <div><dt>Next check</dt><dd>{% if enabled %}<time data-ts="{{ next_run_ts }}">{{ next_run }}</time>{% else %}Disabled{% endif %}</dd></div>
+        <div><dt>Mode</dt><dd>{% if cfg.dry_run %}Dry run{% else %}Live{% endif %}</dd></div>
+      </dl>
+    </section>
+  </div>
+</div>
+
+<section class="card">
+  <div class="label-row">
+    <h2>Due to recur now</h2>
+    <div class="actions">
+      <form method="post" action="/guilds/{{ guild.id }}/modules/recurring/refresh">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <button class="btn btn-ghost btn-sm" type="submit">Refresh from ClickUp</button>
+      </form>
+      <form method="post" action="/guilds/{{ guild.id }}/modules/recurring/run"{% if !cfg.dry_run %} data-confirm="Change these tasks in ClickUp now?"{% endif %}>
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        <button class="btn btn-primary btn-sm" type="submit">{% if cfg.dry_run %}Dry run now{% else %}Run now{% endif %}</button>
+      </form>
+    </div>
+  </div>
+  {% if let Some(err) = preview_error %}
+  <div class="callout callout-err small">{{ err }}</div>
+  {% else if preview.is_empty() %}
+  <p class="muted">No tagged task is due to recur. Tasks read from ClickUp are kept for 5 minutes.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Task</th><th>Rule</th><th>Due</th><th>Next due</th></tr></thead>
+      <tbody>
+      {% for p in preview %}
+      <tr>
+        <td>{% if p.url.starts_with("https://") %}<a href="{{ p.url }}" target="_blank" rel="noopener noreferrer">{{ p.title }}</a>{% else %}{{ p.title }}{% endif %}</td>
+        <td class="small">{{ p.rule }}<br><span class="muted">{{ p.action }}, status: {{ p.status }}</span></td>
+        <td><time data-ts="{{ p.old_due }}">{{ p.old_text }}</time></td>
+        <td><time data-ts="{{ p.new_due }}">{{ p.new_text }}</time></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if deferred > 0 %}<p class="hint">{{ deferred }} more tasks are due to recur; they follow in later runs.</p>{% endif %}
+  {% endif %}
+  {% if truncated %}<p class="hint">A tag has more tasks than one run reads (500), some may be missed.</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>Recent activity</h2>
+  {% if recent.is_empty() %}
+  <p class="muted">Nothing yet. Moved, copied and failed tasks will show up here.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Time</th><th>Task</th><th>Due</th><th>Result</th></tr></thead>
+      <tbody>
+      {% for r in recent %}
+      <tr>
+        <td><time data-ts="{{ r.ts }}">{{ r.time }}</time></td>
+        <td>{% if r.task_url.starts_with("https://") %}<a href="{{ r.task_url }}" target="_blank" rel="noopener noreferrer">{{ r.task_name }}</a>{% else %}{{ r.task_name }}{% endif %}<br><span class="muted small">{{ r.rule_name }}</span></td>
+        <td class="small"><time data-ts="{{ r.old_due }}">{{ r.old_text }}</time><br>to <time data-ts="{{ r.new_due }}">{{ r.new_text }}</time></td>
+        <td>
+          {% if r.result == "dry" %}
+          <span class="badge badge-muted">Dry run</span>
+          {% else if r.result == "failed" %}
+          <span class="badge badge-err" title="{{ r.error }}">Failed</span>
+          <br><span class="small text-err">{{ r.error }}</span>
+          {% else if r.result == "copied" %}
+          <span class="badge badge-on">Copied</span>
+          {% else %}
+          <span class="badge badge-on">Moved</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

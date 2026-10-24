@@ -19,6 +19,9 @@
   {% if let Some(s) = token.shared %}
   <p class="hint">Shared key of ClickUp account <strong>{{ s.account }}</strong>, ending in <code>{{ s.hint }}</code>.</p>
   {% endif %}
+  {% if let Some(note) = token.write_note %}
+  <p class="hint">{{ note }}</p>
+  {% endif %}
   {% endif %}
   {% endif %}
 
@@ -47,7 +50,7 @@
       <span>{% if token.own.is_some() %}Replace key{% else %}Personal API key{% endif %}</span>
       <input type="password" name="token" autocomplete="off" spellcheck="false" placeholder="pk_..." maxlength="200" required>
     </label>
-    <p class="hint">In ClickUp: avatar, Settings, Apps, API Token. The key is checked with ClickUp, stored encrypted and never shown again. The bot only reads from ClickUp, it never changes anything there.</p>
+    <p class="hint">In ClickUp: avatar, Settings, Apps, API Token. The key is checked with ClickUp, stored encrypted and never shown again. {% if let Some(note) = token.write_note %}{{ note }}{% else %}The bot only reads from ClickUp with this key, it never changes anything there.{% endif %}</p>
     <div class="actions">
       <button class="btn btn-primary" type="submit">Save key</button>
     </div>

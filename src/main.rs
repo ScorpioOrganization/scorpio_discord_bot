@@ -115,6 +115,9 @@ async fn maintenance(state: AppState) {
         if let Err(e) = modules::calendar::prune(&state.db).await {
             tracing::error!("calendar log cleanup failed: {e:#}");
         }
+        if let Err(e) = modules::recurring::prune(&state.db).await {
+            tracing::error!("recurring tasks log cleanup failed: {e:#}");
+        }
         state.limiter.prune();
         state.members.prune();
         state.cache.prune(Duration::from_secs(3600));

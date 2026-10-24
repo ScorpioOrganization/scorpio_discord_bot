@@ -1,4 +1,4 @@
-//! Dashboard pieces for ClickUp API keys, shared by every module that reads ClickUp.
+//! Dashboard pieces for ClickUp API keys, shared by every module that uses ClickUp.
 //!
 //! A module adds [`token_routes`] to its router, puts a [`TokenView`] named `token` into its
 //! page struct and includes `templates/clickup/token_card.html`.
@@ -29,6 +29,8 @@ pub struct TokenView {
     pub shared: Option<KeyStatus>,
     /// Why the module cannot use ClickUp right now.
     pub problem: Option<&'static str>,
+    /// Set when a module changes ClickUp with this key, instead of only reading.
+    pub write_note: Option<&'static str>,
 }
 
 pub struct KeyStatus {
@@ -97,6 +99,28 @@ async fn key_status(
     }))
 }
 
+/// Whether a module writes to ClickUp with the key of `owner`, as a note for the key card.
+async fn write_note(
+    state: &AppState,
+    guild_id: u64,
+    owner: &str,
+) -> anyhow::Result<Option<&'static str>> {
+    let writer = crate::modules::recurring::ID;
+    if owner == writer {
+        return Ok(Some(
+            "This module changes tasks in ClickUp with this key: it moves their dates and \
+             status, or creates copies.",
+        ));
+    }
+    let shared_writes = owner == SHARED
+        && crate::modules::is_enabled(&state.db, guild_id, writer).await?
+        && tokens::use_shared(&state.db, guild_id, writer).await?;
+    Ok(shared_writes.then_some(
+        "The Recurring tasks module uses this key to change tasks in ClickUp: it moves their \
+         dates and status, or creates copies. Other modules only read.",
+    ))
+}
+
 pub async fn token_view(state: &AppState, guild_id: u64, owner: &str) -> anyhow::Result<TokenView> {
     let shared_option = owner != SHARED;
     let shared = if shared_option {
@@ -114,6 +138,7 @@ pub async fn token_view(state: &AppState, guild_id: u64, owner: &str) -> anyhow:
             .await?
             .err()
             .map(|p| p.message()),
+        write_note: write_note(state, guild_id, owner).await?,
     })
 }
 

@@ -1,6 +1,7 @@
 pub mod calendar;
 pub mod clickup;
 pub mod greeting;
+pub mod recurring;
 pub mod text;
 
 use std::sync::Arc;
@@ -81,6 +82,7 @@ pub fn registry() -> Vec<Arc<dyn Module>> {
         Arc::new(greeting::GreetingModule),
         Arc::new(clickup::ClickUpModule),
         Arc::new(calendar::CalendarModule),
+        Arc::new(recurring::RecurringModule),
     ]
 }
 

@@ -161,6 +161,7 @@ pub async fn fetch(
         include_closed: cfg.include_closed,
         subtasks: cfg.include_subtasks,
         tags: cfg.tags(),
+        markdown: false,
     };
     let result = state
         .clickup

@@ -2,7 +2,7 @@
 //! workspace, and explicit ClickUp person to Discord member mappings. It has no bot events of
 //! its own; switching it off only stops other modules from using the shared key.
 
-mod web;
+pub(crate) mod web;
 
 use std::collections::{HashMap, HashSet};
 

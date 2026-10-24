@@ -7,6 +7,7 @@ Modules:
 - **Greeting**: posts a customizable welcome message to a chosen channel when someone joins the server.
 - **ClickUp**: stores the ClickUp API key other modules can share, matches ClickUp people to server members and maps ClickUp tags to server roles.
 - **Calendar**: reads meetings and events from a ClickUp list and posts scheduled agendas and reminders before each event.
+- **Recurring tasks**: moves tagged ClickUp tasks to their next date (or creates a copy there) when ClickUp's own recurrence does not run, for example once a Free plan workspace is out of automations.
 
 ## Discord setup
 
@@ -176,6 +177,29 @@ Behavior worth knowing:
 - Tasks are read in pages; if a list has more than about 500 matching tasks in the time window, some can be missed and the page says so. A tag filter helps.
 - The page shows the upcoming events of the next 7 days with matched members, each rule's next run, statistics (digests, reminders, failed posts, missed digests, ClickUp errors) and recent activity. The rule page shows a preview of the rule's next post (for a digest, the window of its next scheduled time) and has a **Send test message** button that posts it.
 
+## Recurring tasks module
+
+Configured per server under **Overview > server > Recurring tasks**. This is the only module that changes anything in ClickUp. ClickUp's API does not show or set a task's recurrence settings, so the rules live in the dashboard: each rule maps a ClickUp tag to an interval, and tasks with that tag recur. Tag a task to make it recur, remove the tag to stop it. Remove ClickUp's own recurrence from tagged tasks, otherwise a task can be moved twice.
+
+**Settings**: the ClickUp workspace searched for tagged tasks (all its lists), the time zone intervals are counted in, how often to check (5 to 1440 minutes, default 15) and **dry run**. Dry run is on until you turn it off: runs then only log what they would change.
+
+**Rules** (up to 20 per server, one per tag):
+
+- **Repeat every** N days, weeks, months or years.
+- **Recur when done** (the task is in a done or closed status) or **when due** (its due date passed, done or not).
+- **Then move the task** (new due and start date, status back to open) or **keep it and create a copy** at the next date. A copy gets the name, description, tags, assignees, priority and parent task; checklists, subtasks, custom fields and attachments are not copied. Copies are only made for tasks due in the last 60 days, so a new rule never copies old history.
+- **Status after recurring**: a status name, or empty for the first open status of the task's list (like "to do").
+- Whether the start date moves too.
+
+Behavior worth knowing:
+
+- The next due date is the first one after now, a whole number of intervals after the old due date. Occurrences missed while nothing ran are skipped, and a task done early keeps its rhythm (done on Wednesday, due Friday, weekly: next due the Friday after). Steps are counted in the configured time zone, so 09:00 stays 09:00 across daylight saving changes, and the 31st becomes the last day of shorter months.
+- Leaving out a date's time keeps whether ClickUp shows a time. Copies of tasks due at 04:00 in the configured time zone (how ClickUp stores a date without a time) get a date without a time.
+- At most 25 tasks change per run, the rest follow in later runs. Every occurrence (task and due date) is handled once, even if a copy's original stays overdue.
+- A change ClickUp refuses (for example a status name that does not exist in the task's list) is logged and counted once, and retried on later runs. A copy that fails without a clear answer (timeout, ClickUp server error) is not retried, because ClickUp may have created it anyway: check the task in ClickUp.
+- Scheduled runs need the bot connected to Discord. **Run now** on the module page works anyway, and the page previews which tasks the next run would change.
+- The page shows the rules, statistics (moved, copied, failed, ClickUp errors), the last and next run, the preview and recent activity.
+
 ## Security notes
 
 - Passwords hashed with Argon2id. Sessions are random 256 bit tokens, only their SHA-256 is stored, cookie is `HttpOnly` and `SameSite=Lax`.
@@ -183,7 +207,7 @@ Behavior worth knowing:
 - Login is throttled per IP (5 failures in 15 minutes) and per username (20 failures).
 - Strict Content Security Policy, no inline scripts or styles, frame embedding denied.
 - Third party API keys are encrypted at rest with a key that is not in the database, write-only in the dashboard and never logged.
-- ClickUp access is read-only by construction: the client only implements GET requests.
+- ClickUp access is read-only except for the Recurring tasks module: the client's only write calls change a task's status and dates or create a task, and only that module uses them. It starts in dry run mode and changes at most 25 tasks per run.
 - Messages restrict pings to the users and roles a module explicitly allows, never `@everyone` or `@here`.
 
 ## Adding a module
@@ -194,7 +218,7 @@ Behavior worth knowing:
 
 The guild page lists the module with an enable/disable switch automatically, and the bot only calls its hooks in servers where it is enabled. Modules that work on a schedule return `true` from `ticks()` and get `on_tick` about once a minute per server.
 
-A module that reads ClickUp reuses the shared pieces instead of handling keys itself: `clickup::web::token_routes("<id>")` and `templates/clickup/token_card.html` give it the API key card (shared or own key), `clickup::tokens::resolve` and `track` give it a key and record each call, `modules::clickup::resolver` matches ClickUp people to members and `modules::clickup::tag_roles` gives the tag to role mappings. The Calendar module is the example.
+A module that uses ClickUp reuses the shared pieces instead of handling keys itself: `clickup::web::token_routes("<id>")` and `templates/clickup/token_card.html` give it the API key card (shared or own key), `clickup::tokens::resolve` and `track` give it a key and record each call, `modules::clickup::resolver` matches ClickUp people to members and `modules::clickup::tag_roles` gives the tag to role mappings. The Calendar module is the example.
 
 ## Development
 

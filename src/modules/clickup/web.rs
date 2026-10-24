@@ -130,10 +130,12 @@ async fn fetch_teams(
     tokens::track(&state.db, gid, ID, cred, result).await
 }
 
-/// Tag names (normalized) of every space in a workspace, sorted.
-async fn workspace_tags(
+/// Tag names (normalized) of every space in a workspace, sorted. API calls count for
+/// `module_id`.
+pub(crate) async fn workspace_tags(
     state: &AppState,
     gid: u64,
+    module_id: &str,
     cred: &Credential,
     team_id: &str,
 ) -> Result<Arc<Vec<String>>, ClickUpError> {
@@ -144,11 +146,18 @@ async fn workspace_tags(
         return Ok(hit);
     }
     let (db, client, token) = (&state.db, &state.clickup, &cred.token);
-    let spaces = tokens::track(db, gid, ID, cred, client.spaces(token, team_id).await).await?;
+    let spaces = tokens::track(
+        db,
+        gid,
+        module_id,
+        cred,
+        client.spaces(token, team_id).await,
+    )
+    .await?;
     let mut names = HashSet::new();
     for space in spaces.iter().take(TAGS_MAX_SPACES) {
-        let tags =
-            tokens::track(db, gid, ID, cred, client.space_tags(token, &space.id).await).await?;
+        let result = client.space_tags(token, &space.id).await;
+        let tags = tokens::track(db, gid, module_id, cred, result).await?;
         names.extend(tags.iter().filter_map(|t| normalize_tag(t.name())));
     }
     let mut names: Vec<String> = names.into_iter().collect();
@@ -156,7 +165,7 @@ async fn workspace_tags(
     Ok(state.cache.insert(key, names))
 }
 
-fn invalidate_tags(state: &AppState, gid: u64) {
+pub(crate) fn invalidate_tags(state: &AppState, gid: u64) {
     state.cache.remove_prefix(&format!("clickup:tags:{gid}:"));
 }
 
@@ -221,7 +230,7 @@ async fn page(
     let mut tag_error = None;
     let mut known_tags = Vec::new();
     if let (Ok(cred), Some(team)) = (&cred, selected) {
-        match workspace_tags(&state, gid, cred, &team.id).await {
+        match workspace_tags(&state, gid, ID, cred, &team.id).await {
             Ok(tags) => known_tags = tags.to_vec(),
             Err(e) => tag_error = Some(e.to_string()),
         }

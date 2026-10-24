@@ -256,6 +256,30 @@ impl Flash {
                 false,
                 "Reactions must be up to 5 emojis, custom ones from this server only.",
             ),
+            "recurring_no_workspace" => (false, "Select and save a ClickUp workspace first."),
+            "recurring_no_rules" => (false, "Add an active rule first."),
+            "recurring_interval" => (false, "Check every 5 to 1440 minutes."),
+            "recurring_ran" => (true, "Run finished. See the result in recent activity."),
+            "recurring_ran_failed" => (
+                false,
+                "Run finished, but some tasks could not be changed. See recent activity.",
+            ),
+            "recurring_dry_ran" => (
+                true,
+                "Dry run finished, nothing was changed in ClickUp. See recent activity.",
+            ),
+            "recurring_busy" => (false, "A run is already in progress, try again shortly."),
+            "rule_tag" => (
+                false,
+                "The tag must be 1 to 100 characters, without commas.",
+            ),
+            "rule_tag_taken" => (false, "Another rule already uses this tag."),
+            "rule_every" => (false, "Repeat every 1 to 365 days, weeks, months or years."),
+            "rule_invalid" => (
+                false,
+                "Pick an interval, trigger and action from the lists.",
+            ),
+            "rule_status" => (false, "The status name must be at most 60 characters."),
             "pw_changed" => (
                 true,
                 "Password changed. Your other sessions were signed out.",

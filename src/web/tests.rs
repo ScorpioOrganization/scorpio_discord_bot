@@ -5,6 +5,7 @@ use crate::clickup::mapping::Explicit;
 use crate::clickup::{mock, tokens};
 use crate::modules::calendar::{self, Kind, Rule};
 use crate::modules::clickup::{explicit_mappings, set_tag_role, tag_role_rows};
+use crate::modules::recurring;
 use crate::test_util::{
     CHANNEL_ID, EMOJI_ID, GUILD_ID, GUILD_NAME, IP, LEADS_ROLE_ID, MEMBER_ID, ROLE_ID, ROOT_PW,
     TestApp, TestResponse, VOICE_CHANNEL_ID,
@@ -333,6 +334,9 @@ async fn guild_routes_404_without_discord() {
         "/guilds/1/modules/calendar",
         "/guilds/1/modules/calendar/rules/new?kind=digest",
         "/guilds/1/modules/calendar/rules/1",
+        "/guilds/1/modules/recurring",
+        "/guilds/1/modules/recurring/rules/new",
+        "/guilds/1/modules/recurring/rules/1",
     ] {
         let res = app.get(path, Some(&cookie)).await;
         assert_eq!(res.status, StatusCode::NOT_FOUND, "{path}");
@@ -383,6 +387,20 @@ async fn guild_routes_404_without_discord() {
         ("/guilds/1/modules/calendar/rules/1", vec![("name", "x")]),
         ("/guilds/1/modules/calendar/rules/1/delete", vec![]),
         ("/guilds/1/modules/calendar/rules/1/test", vec![]),
+        ("/guilds/1/modules/recurring/toggle", vec![("enabled", "1")]),
+        (
+            "/guilds/1/modules/recurring",
+            vec![("timezone", "UTC"), ("check_minutes", "15")],
+        ),
+        ("/guilds/1/modules/recurring/refresh", vec![]),
+        ("/guilds/1/modules/recurring/run", vec![]),
+        (
+            "/guilds/1/modules/recurring/token",
+            vec![("token", mock::TOKEN)],
+        ),
+        ("/guilds/1/modules/recurring/rules", vec![("name", "x")]),
+        ("/guilds/1/modules/recurring/rules/1", vec![("name", "x")]),
+        ("/guilds/1/modules/recurring/rules/1/delete", vec![]),
     ];
     for (path, mut form) in posts {
         form.push(("_csrf", &csrf));
@@ -396,7 +414,8 @@ async fn guild_routes_404_without_discord() {
               + (SELECT COUNT(*) FROM clickup_config) + (SELECT COUNT(*) FROM clickup_user_map)
               + (SELECT COUNT(*) FROM clickup_token_source)
               + (SELECT COUNT(*) FROM clickup_tag_roles)
-              + (SELECT COUNT(*) FROM calendar_config) + (SELECT COUNT(*) FROM calendar_rules)",
+              + (SELECT COUNT(*) FROM calendar_config) + (SELECT COUNT(*) FROM calendar_rules)
+              + (SELECT COUNT(*) FROM recurring_config) + (SELECT COUNT(*) FROM recurring_rules)",
     )
     .fetch_one(db)
     .await
@@ -1410,4 +1429,417 @@ async fn calendar_test_message_reports_failures() {
         0,
         "tests are not counted"
     );
+}
+
+fn recurring_path(suffix: &str) -> String {
+    format!("/guilds/{GUILD_ID}/modules/recurring{suffix}")
+}
+
+/// Saves the mock's workspace in the recurring module, live or in dry run.
+async fn recurring_settings(app: &TestApp, cookie: &str, csrf: &str, dry_run: bool) {
+    let mut form = vec![
+        ("_csrf", csrf),
+        ("team_id", mock::TEAM_ID),
+        ("timezone", "Europe/Warsaw"),
+        ("check_minutes", "30"),
+    ];
+    if dry_run {
+        form.push(("dry_run", "on"));
+    }
+    let res = app.post(&recurring_path(""), Some(cookie), &form).await;
+    assert_eq!(res.redirect(), recurring_path("?msg=saved"));
+}
+
+fn recurring_rule_form(csrf: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("_csrf", csrf.to_owned()),
+        ("name", "Weekly sync".into()),
+        ("enabled", "on".into()),
+        ("tag", "Weekly".into()),
+        ("every", "1".into()),
+        ("unit", "week".into()),
+        ("trigger", "close".into()),
+        ("mode", "update".into()),
+        ("reopen_status", "".into()),
+        ("shift_start", "on".into()),
+    ]
+}
+
+#[tokio::test]
+async fn recurring_routes_require_login_and_csrf() {
+    let app = TestApp::with_guild().await;
+    for path in [recurring_path(""), recurring_path("/rules/new")] {
+        assert_eq!(app.get(&path, None).await.redirect(), "/login", "{path}");
+    }
+    let cookie = app.login_root().await;
+    for suffix in [
+        "",
+        "/refresh",
+        "/run",
+        "/rules",
+        "/rules/1",
+        "/rules/1/delete",
+        "/token",
+        "/token/delete",
+        "/token/source",
+    ] {
+        let path = recurring_path(suffix);
+        assert_eq!(
+            app.post(&path, None, &[]).await.redirect(),
+            "/login",
+            "{path}"
+        );
+        let res = app.post(&path, Some(&cookie), &[("name", "x")]).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}");
+    }
+    assert!(app.clickup.requests().is_empty());
+}
+
+#[tokio::test]
+async fn recurring_settings_are_validated() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+
+    // Shared key by default, but the ClickUp module is off.
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("team_id", mock::TEAM_ID),
+        ("timezone", "UTC"),
+        ("check_minutes", "15"),
+    ];
+    let res = app.post(&recurring_path(""), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), recurring_path("?msg=clickup_disabled"));
+
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    let page = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains(&format!(
+            r#"<option value="{}" selected>Scorpio Team"#,
+            mock::TEAM_ID
+        )),
+        "the only workspace is offered first"
+    );
+    assert!(page.body.contains("No ClickUp workspace is saved yet"));
+    assert!(page.body.contains("Dry run is on"));
+
+    recurring_settings(&app, &cookie, &csrf, false).await;
+    let cfg = recurring::load_config(db, GUILD_ID).await.unwrap();
+    assert_eq!(cfg.team_id.as_deref(), Some(mock::TEAM_ID));
+    assert_eq!(cfg.team_name.as_deref(), Some("Scorpio Team"));
+    assert_eq!(cfg.timezone, "Europe/Warsaw");
+    assert_eq!(cfg.check_minutes, 30);
+    assert!(!cfg.dry_run, "unchecked box turns dry run off");
+
+    let cases = [
+        ("team_id", "999", "workspace_invalid"),
+        ("timezone", "Mars/Base", "timezone_invalid"),
+        ("check_minutes", "4", "recurring_interval"),
+        ("check_minutes", "1441", "recurring_interval"),
+        ("check_minutes", "soon", "recurring_interval"),
+    ];
+    for (field, value, code) in cases {
+        let mut form = vec![
+            ("_csrf", csrf.as_str()),
+            ("team_id", mock::TEAM_ID),
+            ("timezone", "UTC"),
+            ("check_minutes", "15"),
+        ];
+        form.retain(|(k, _)| *k != field);
+        form.push((field, value));
+        let res = app.post(&recurring_path(""), Some(&cookie), &form).await;
+        assert_eq!(
+            res.redirect(),
+            recurring_path(&format!("?msg={code}")),
+            "{field}={value}"
+        );
+    }
+    assert_eq!(recurring::load_config(db, GUILD_ID).await.unwrap(), cfg);
+
+    // No workspace is allowed and stops the module from reading anything.
+    let form = [
+        ("_csrf", csrf.as_str()),
+        ("team_id", ""),
+        ("timezone", "UTC"),
+        ("check_minutes", "15"),
+        ("dry_run", "on"),
+    ];
+    let res = app.post(&recurring_path(""), Some(&cookie), &form).await;
+    assert_eq!(res.redirect(), recurring_path("?msg=saved"));
+    let cfg = recurring::load_config(db, GUILD_ID).await.unwrap();
+    assert_eq!((cfg.team_id, cfg.dry_run), (None, true));
+    assert!(app.clickup.writes().is_empty());
+}
+
+#[tokio::test]
+async fn recurring_rule_create_validate_edit_delete() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    recurring_settings(&app, &cookie, &csrf, true).await;
+
+    let page = app.get(&recurring_path("/rules/new"), Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains(r#"<option value="team sync">"#),
+        "workspace tags offered"
+    );
+    assert!(page.body.contains("moves to"));
+
+    let base = recurring_rule_form(&csrf);
+    let cases = [
+        ("name", Some(""), "rule_name"),
+        ("tag", Some(""), "rule_tag"),
+        ("every", Some("0"), "rule_every"),
+        ("unit", Some("fortnight"), "rule_invalid"),
+        ("trigger", None, "rule_invalid"),
+        ("mode", Some("delete"), "rule_invalid"),
+    ];
+    for (key, value, code) in cases {
+        let form = with_field(&base, key, value);
+        let res = post_owned(&app, &recurring_path("/rules"), &cookie, &form).await;
+        assert_eq!(
+            res.redirect(),
+            recurring_path(&format!("/rules/new?msg={code}")),
+            "{key}"
+        );
+    }
+    assert_eq!(recurring::count_rules(db, GUILD_ID).await.unwrap(), 0);
+
+    let res = post_owned(&app, &recurring_path("/rules"), &cookie, &base).await;
+    let rules = recurring::list_rules(db, GUILD_ID).await.unwrap();
+    assert_eq!(rules.len(), 1);
+    let rule = &rules[0];
+    assert_eq!(
+        res.redirect(),
+        recurring_path(&format!("/rules/{}?msg=rule_created", rule.id))
+    );
+    assert_eq!((rule.tag.as_str(), rule.every), ("weekly", 1));
+    assert!(rule.enabled && rule.shift_start);
+
+    // One rule per tag, ignoring case.
+    let dup = with_field(&base, "tag", Some("WEEKLY"));
+    let res = post_owned(&app, &recurring_path("/rules"), &cookie, &dup).await;
+    assert_eq!(
+        res.redirect(),
+        recurring_path("/rules/new?msg=rule_tag_taken")
+    );
+    let other = with_field(&base, "tag", Some("monthly"));
+    post_owned(&app, &recurring_path("/rules"), &cookie, &other).await;
+    let monthly = recurring::list_rules(db, GUILD_ID).await.unwrap()[1].id;
+    let path = recurring_path(&format!("/rules/{monthly}"));
+    let res = post_owned(&app, &path, &cookie, &base).await;
+    assert_eq!(res.redirect(), format!("{path}?msg=rule_tag_taken"));
+
+    let path = recurring_path(&format!("/rules/{}", rule.id));
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains(r#"value="weekly""#));
+    let mut edit = with_field(&base, "mode", Some("create"));
+    edit = with_field(&edit, "trigger", Some("schedule"));
+    edit = with_field(&edit, "every", Some("2"));
+    edit = with_field(&edit, "enabled", None);
+    let res = post_owned(&app, &path, &cookie, &edit).await;
+    assert_eq!(res.redirect(), format!("{path}?msg=saved"));
+    let saved = recurring::load_rule(db, GUILD_ID, rule.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.mode, recurring::Mode::Create);
+    assert_eq!(saved.trigger, recurring::Trigger::Schedule);
+    assert_eq!(saved.every, 2);
+    assert!(!saved.enabled);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(page.body.contains("gets a copy due"));
+    assert!(page.body.contains("not copied"));
+
+    let list = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert!(list.body.contains("Every 2 weeks"));
+    assert!(list.body.contains("<code>monthly</code>"));
+
+    let form = [("_csrf", csrf.as_str())];
+    let res = app
+        .post(&format!("{path}/delete"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), recurring_path("?msg=rule_deleted"));
+    assert_eq!(recurring::count_rules(db, GUILD_ID).await.unwrap(), 1);
+    let res = app
+        .post(&format!("{path}/delete"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(app.clickup.writes().is_empty());
+}
+
+#[tokio::test]
+async fn recurring_rules_of_other_guilds_are_not_reachable() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+    let mut rule = recurring::Rule::new();
+    rule.name = "Foreign".into();
+    rule.tag = "weekly".into();
+    let foreign = recurring::insert_rule(db, 42, &rule, "x").await.unwrap();
+
+    let path = recurring_path(&format!("/rules/{foreign}"));
+    assert_eq!(
+        app.get(&path, Some(&cookie)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let form = recurring_rule_form(&csrf);
+    for target in [path.clone(), format!("{path}/delete")] {
+        let res = post_owned(&app, &target, &cookie, &form).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{target}");
+    }
+    assert_eq!(recurring::count_rules(db, 42).await.unwrap(), 1);
+    // A tag used in another guild is free here.
+    let res = post_owned(&app, &recurring_path("/rules"), &cookie, &form).await;
+    assert!(res.redirect().ends_with("?msg=rule_created"));
+}
+
+#[tokio::test]
+async fn recurring_rule_limit() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    for i in 0..recurring::MAX_RULES {
+        let mut rule = recurring::Rule::new();
+        rule.name = format!("Rule {i}");
+        rule.tag = format!("tag{i}");
+        recurring::insert_rule(&app.state.db, GUILD_ID, &rule, "root")
+            .await
+            .unwrap();
+    }
+    let form = with_field(&recurring_rule_form(&csrf), "tag", Some("fresh"));
+    let res = post_owned(&app, &recurring_path("/rules"), &cookie, &form).await;
+    assert_eq!(res.redirect(), recurring_path("?msg=too_many_rules"));
+    let page = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert!(page.body.contains("maximum number of rules"));
+}
+
+#[tokio::test]
+async fn recurring_preview_and_run_now() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    let db = &app.state.db;
+    let form = [("_csrf", csrf.as_str())];
+
+    let res = app
+        .post(&recurring_path("/run"), Some(&cookie), &form)
+        .await;
+    assert_eq!(
+        res.redirect(),
+        recurring_path("?msg=recurring_no_workspace")
+    );
+
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    recurring_settings(&app, &cookie, &csrf, true).await;
+    let res = app
+        .post(&recurring_path("/run"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), recurring_path("?msg=recurring_no_rules"));
+    post_owned(
+        &app,
+        &recurring_path("/rules"),
+        &cookie,
+        &recurring_rule_form(&csrf),
+    )
+    .await;
+
+    let now = crate::db::now();
+    let mut done = mock::task("t1", "Weekly <report>", Some((now - 86_400) * 1000));
+    done["status"] = serde_json::json!({"status": "complete", "type": "closed"});
+    done["tags"] = serde_json::json!([{"name": "weekly"}]);
+    let mut open = mock::task("t2", "Still open", Some((now - 86_400) * 1000));
+    open["tags"] = serde_json::json!([{"name": "weekly"}]);
+    app.clickup.set_tasks(mock::LIST_ID, vec![done, open]);
+
+    let page = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains("Weekly &#60;report&#62;"),
+        "escaped task name in preview"
+    );
+    assert!(!page.body.contains("Still open"));
+    assert!(page.body.contains("Dry run now"));
+
+    let res = app
+        .post(&recurring_path("/run"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), recurring_path("?msg=recurring_dry_ran"));
+    assert!(app.clickup.writes().is_empty());
+    let page = app
+        .get(&recurring_path("?msg=recurring_dry_ran"), Some(&cookie))
+        .await;
+    assert!(page.body.contains("Dry run finished"));
+    assert!(
+        page.body
+            .contains(r#"<span class="badge badge-muted">Dry run</span>"#)
+    );
+
+    recurring_settings(&app, &cookie, &csrf, false).await;
+    let page = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains(r#"data-confirm="Change these tasks in ClickUp now?""#)
+    );
+    let res = app
+        .post(&recurring_path("/run"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), recurring_path("?msg=recurring_ran"));
+    let writes = app.clickup.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].path, "/task/t1");
+    assert_eq!(writes[0].json()["status"], "to do");
+    assert_eq!(
+        crate::modules::counter(db, Some(GUILD_ID), "recurring", "moved")
+            .await
+            .unwrap(),
+        1
+    );
+    let page = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains(r#"<span class="badge badge-on">Moved</span>"#)
+    );
+    assert!(page.body.contains("No tagged task is due to recur"));
+
+    let res = app
+        .post(&recurring_path("/refresh"), Some(&cookie), &form)
+        .await;
+    assert_eq!(res.redirect(), recurring_path("?msg=refreshed"));
+}
+
+#[tokio::test]
+async fn key_cards_say_when_a_key_changes_clickup() {
+    let app = TestApp::with_guild().await;
+    let cookie = app.login_root().await;
+    let csrf = app.csrf(&cookie).await;
+    shared_clickup_key(&app, &cookie, &csrf).await;
+    let reads_only = "The bot only reads from ClickUp with this key";
+
+    let page = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(page.body.contains(reads_only));
+    let page = app.get(&recurring_path(""), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains("This module changes tasks in ClickUp with this key")
+    );
+
+    let form = [("_csrf", csrf.as_str()), ("enabled", "1")];
+    app.post(&recurring_path("/toggle"), Some(&cookie), &form)
+        .await;
+    let page = app.get(&clickup_path(""), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains("The Recurring tasks module uses this key")
+    );
+    assert!(!page.body.contains(reads_only));
+    let page = app.get(&calendar_path(""), Some(&cookie)).await;
+    assert!(!page.body.contains("changes tasks"), "calendar only reads");
 }
