@@ -15,63 +15,63 @@ use super::{
     save_config, schedule, tag_taken, update_rule,
 };
 use crate::auth::extract::CurrentUser;
-use crate::bot::info::GuildSummary;
 use crate::clickup::ClickUpError;
 use crate::clickup::client::Team;
-use crate::clickup::tokens::{self, Credential};
-use crate::clickup::web::{TokenView, token_routes, token_view};
 use crate::db::now;
 use crate::error::{AppError, AppResult};
+use crate::keys::web::{KeyView, key_routes, key_view};
+use crate::keys::{self, Credential, Service};
 use crate::modules::calendar::schedule::{fmt_local, tz_name, tz_names};
 use crate::modules::clickup::web::{invalidate_tags, workspace_tags};
 use crate::modules::{self, clickup, counter};
+use crate::projects::Project;
 use crate::state::AppState;
-use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_guild};
+use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_project};
 
 const TEAMS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/guilds/{gid}/modules/recurring",
+            "/projects/{pid}/modules/recurring",
             get(page).post(save_settings),
         )
-        .route("/guilds/{gid}/modules/recurring/refresh", post(refresh))
-        .route("/guilds/{gid}/modules/recurring/run", post(run_now))
-        .route("/guilds/{gid}/modules/recurring/rules", post(create))
-        .route("/guilds/{gid}/modules/recurring/rules/new", get(new_rule))
+        .route("/projects/{pid}/modules/recurring/refresh", post(refresh))
+        .route("/projects/{pid}/modules/recurring/run", post(run_now))
+        .route("/projects/{pid}/modules/recurring/rules", post(create))
+        .route("/projects/{pid}/modules/recurring/rules/new", get(new_rule))
         .route(
-            "/guilds/{gid}/modules/recurring/rules/{rid}",
+            "/projects/{pid}/modules/recurring/rules/{rid}",
             get(edit_rule).post(save_rule),
         )
         .route(
-            "/guilds/{gid}/modules/recurring/rules/{rid}/delete",
+            "/projects/{pid}/modules/recurring/rules/{rid}/delete",
             post(remove_rule),
         )
-        .merge(token_routes(ID))
+        .merge(key_routes(Service::ClickUp, ID))
 }
 
-fn base_path(gid: u64) -> String {
-    format!("/guilds/{gid}/modules/{ID}")
+fn base_path(pid: i64) -> String {
+    format!("/projects/{pid}/modules/{ID}")
 }
 
-fn rule_path(gid: u64, rid: i64) -> String {
-    format!("{}/rules/{rid}", base_path(gid))
+fn rule_path(pid: i64, rid: i64) -> String {
+    format!("{}/rules/{rid}", base_path(pid))
 }
 
 /// Workspaces the key can access, cached by the key itself.
 async fn fetch_teams(
     state: &AppState,
-    gid: u64,
+    pid: i64,
     cred: &Credential,
 ) -> Result<Arc<Vec<Team>>, ClickUpError> {
     let fingerprint = &crate::auth::hash_token(cred.token.expose())[..16];
-    let key = format!("recurring:teams:{gid}:{fingerprint}");
+    let key = format!("recurring:teams:{pid}:{fingerprint}");
     if let Some(hit) = state.cache.get::<Vec<Team>>(&key, TEAMS_MAX_AGE) {
         return Ok(hit);
     }
     let result = state.clickup.teams(&cred.token).await;
-    let teams = tokens::track(&state.db, gid, ID, cred, result).await?;
+    let teams = keys::track(&state.db, pid, ID, cred, result).await?;
     Ok(state.cache.insert(key, teams))
 }
 
@@ -148,10 +148,10 @@ impl LogView {
 #[template(path = "modules/recurring.html")]
 struct RecurringPage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
     enabled: bool,
     warnings: Vec<String>,
-    token: TokenView,
+    keys: Vec<KeyView>,
     cfg: RecurringConfig,
     teams: Vec<TeamOption>,
     team_error: Option<String>,
@@ -191,13 +191,13 @@ impl RecurringPage {
 async fn page(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(&state, gid)?;
-    let enabled = modules::is_enabled(&state.db, gid, ID).await?;
-    let cfg = load_config(&state.db, gid).await?;
-    let rules = list_rules(&state.db, gid).await?;
+    let project = require_project(&state, pid).await?;
+    let enabled = modules::is_enabled(&state.db, pid, ID).await?;
+    let cfg = load_config(&state.db, pid).await?;
+    let rules = list_rules(&state.db, pid).await?;
     let tz = cfg.tz();
     let now = now();
 
@@ -224,13 +224,13 @@ async fn page(
 
     let mut teams = Vec::new();
     let mut team_error = None;
-    if let Ok(cred) = tokens::resolve(&state, gid, ID).await? {
-        match fetch_teams(&state, gid, &cred).await {
+    if let Ok(cred) = keys::resolve(&state, pid, Service::ClickUp, ID).await? {
+        match fetch_teams(&state, pid, &cred).await {
             Ok(list) => {
                 // Until a workspace is saved, offer the ClickUp module's one, or the only one.
                 let default = match &cfg.team_id {
                     Some(id) => Some(id.clone()),
-                    None => clickup::load_config(&state.db, gid)
+                    None => clickup::load_config(&state.db, pid)
                         .await?
                         .team_id
                         .or_else(|| (list.len() == 1).then(|| list[0].id.clone())),
@@ -255,7 +255,7 @@ async fn page(
     let mut preview = Vec::new();
     let mut preview_error = None;
     let (mut deferred, mut truncated) = (0, false);
-    match runner::preview(&state, gid, now).await? {
+    match runner::preview(&state, pid, now).await? {
         Ok((plan, cut)) => {
             deferred = plan.deferred;
             truncated = cut;
@@ -292,14 +292,14 @@ async fn page(
         })
         .collect();
 
-    let stat = |key| counter(&state.db, Some(gid), ID, key);
+    let stat = |key| counter(&state.db, Some(pid), ID, key);
     let next_run_at = cfg.next_run_at().unwrap_or(now).max(now);
     let page = RecurringPage {
-        page: PageCtx::new(&user, "guilds", &msg),
-        guild,
+        page: PageCtx::new(&user, "projects", &msg),
+        project,
         enabled,
         warnings,
-        token: token_view(&state, gid, ID).await?,
+        keys: vec![key_view(&state, pid, Service::ClickUp, ID).await?],
         teams,
         team_error,
         team_outside_list,
@@ -324,7 +324,7 @@ async fn page(
         copied: stat("copied").await?,
         failed: stat("failed").await?,
         api_err: stat("api_err").await?,
-        recent: recent_log(&state.db, gid, 15)
+        recent: recent_log(&state.db, pid, 15)
             .await?
             .into_iter()
             .map(|r| LogView::new(r, &tz))
@@ -346,12 +346,12 @@ struct SettingsForm {
 async fn save_settings(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(form): Form<SettingsForm>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
-    let current = load_config(&state.db, gid).await?;
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
+    let current = load_config(&state.db, pid).await?;
 
     let Some(timezone) = tz_name(&form.timezone) else {
         return Ok(redirect_msg(&back, "timezone_invalid"));
@@ -372,11 +372,11 @@ async fn save_settings(
     } else if current.team_id.as_deref() == Some(team_id) {
         current.team_id.clone().zip(current.team_name.clone())
     } else {
-        let cred = match tokens::resolve(&state, gid, ID).await? {
+        let cred = match keys::resolve(&state, pid, Service::ClickUp, ID).await? {
             Ok(c) => c,
             Err(p) => return Ok(redirect_msg(&back, Problem::Token(p).code())),
         };
-        let teams = match fetch_teams(&state, gid, &cred).await {
+        let teams = match fetch_teams(&state, pid, &cred).await {
             Ok(t) => t,
             Err(e) => return Ok(redirect_msg(&back, Problem::Api(e).code())),
         };
@@ -395,10 +395,10 @@ async fn save_settings(
         dry_run: form.dry_run.is_some(),
         last_run_at: current.last_run_at,
     };
-    save_config(&state.db, gid, &cfg, &user.username).await?;
-    runner::invalidate_preview(&state, gid);
+    save_config(&state.db, pid, &cfg, &user.username).await?;
+    runner::invalidate_preview(&state, pid);
     tracing::info!(
-        user = %user.username, guild_id = gid, team = ?cfg.team_id, dry_run = cfg.dry_run,
+        user = %user.username, project_id = pid, team = ?cfg.team_id, dry_run = cfg.dry_run,
         "recurring settings saved"
     );
     Ok(redirect_msg(&back, "saved"))
@@ -407,25 +407,25 @@ async fn save_settings(
 async fn refresh(
     State(state): State<AppState>,
     CurrentUser(_user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    runner::invalidate_preview(&state, gid);
+    require_project(&state, pid).await?;
+    runner::invalidate_preview(&state, pid);
     for prefix in ["recurring:teams", "recurring:status"] {
-        state.cache.remove_prefix(&format!("{prefix}:{gid}:"));
+        state.cache.remove_prefix(&format!("{prefix}:{pid}:"));
     }
-    invalidate_tags(&state, gid);
-    Ok(redirect_msg(&base_path(gid), "refreshed"))
+    invalidate_tags(&state, pid);
+    Ok(redirect_msg(&base_path(pid), "refreshed"))
 }
 
 async fn run_now(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let outcome = runner::run(&state, gid, now(), true).await?;
-    tracing::info!(user = %user.username, guild_id = gid, ?outcome, "recurring run started from the dashboard");
+    require_project(&state, pid).await?;
+    let outcome = runner::run(&state, pid, now(), true).await?;
+    tracing::info!(user = %user.username, project_id = pid, ?outcome, "recurring run started from the dashboard");
     let code = match outcome {
         Outcome::Done(r) if r.dry_run => "recurring_dry_ran",
         Outcome::Done(r) if r.failed > 0 => "recurring_ran_failed",
@@ -433,7 +433,7 @@ async fn run_now(
         Outcome::Busy => "recurring_busy",
         Outcome::Problem(p) => p.code(),
     };
-    Ok(redirect_msg(&base_path(gid), code))
+    Ok(redirect_msg(&base_path(pid), code))
 }
 
 // ---------------------------------------------------------------- rule editor
@@ -448,7 +448,7 @@ struct UnitOption {
 #[template(path = "modules/recurring_rule.html")]
 struct RulePage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
     rule: Rule,
     is_new: bool,
     units: Vec<UnitOption>,
@@ -491,15 +491,15 @@ async fn rule_page(
     state: &AppState,
     user: &crate::auth::SessionUser,
     msg: &MsgQuery,
-    gid: u64,
+    pid: i64,
     rule: Rule,
     is_new: bool,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(state, gid)?;
-    let cfg = load_config(&state.db, gid).await?;
+    let project = require_project(state, pid).await?;
+    let cfg = load_config(&state.db, pid).await?;
 
     let mut warnings = Vec::new();
-    if is_new && count_rules(&state.db, gid).await? >= MAX_RULES {
+    if is_new && count_rules(&state.db, pid).await? >= MAX_RULES {
         warnings.push(format!(
             "This server already has {MAX_RULES} rules, the maximum."
         ));
@@ -507,16 +507,19 @@ async fn rule_page(
 
     let mut tags = Vec::new();
     let mut tags_error = None;
-    if let (Some(team), Ok(cred)) = (&cfg.team_id, tokens::resolve(state, gid, ID).await?) {
-        match workspace_tags(state, gid, ID, &cred, team).await {
+    if let (Some(team), Ok(cred)) = (
+        &cfg.team_id,
+        keys::resolve(state, pid, Service::ClickUp, ID).await?,
+    ) {
+        match workspace_tags(state, pid, ID, &cred, team).await {
             Ok(list) => tags = (*list).clone(),
             Err(e) => tags_error = Some(e.to_string()),
         }
     }
 
     let page = RulePage {
-        page: PageCtx::new(user, "guilds", msg),
-        guild,
+        page: PageCtx::new(user, "projects", msg),
+        project,
         is_new,
         units: Unit::ALL
             .into_iter()
@@ -540,24 +543,24 @@ async fn rule_page(
 async fn new_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    require_guild(&state, gid)?;
-    rule_page(&state, &user, &msg, gid, Rule::new(), true).await
+    require_project(&state, pid).await?;
+    rule_page(&state, &user, &msg, pid, Rule::new(), true).await
 }
 
 async fn edit_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    require_guild(&state, gid)?;
-    let rule = load_rule(&state.db, gid, rid)
+    require_project(&state, pid).await?;
+    let rule = load_rule(&state.db, pid, rid)
         .await?
         .ok_or(AppError::NotFound)?;
-    rule_page(&state, &user, &msg, gid, rule, false).await
+    rule_page(&state, &user, &msg, pid, rule, false).await
 }
 
 /// Applies a submitted rule form to `rule`. Returns a flash code when something is invalid.
@@ -600,65 +603,65 @@ fn parse_rule_form(fields: &[(String, String)], mut rule: Rule) -> Result<Rule, 
 async fn create(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(fields): Form<Vec<(String, String)>>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    if count_rules(&state.db, gid).await? >= MAX_RULES {
-        return Ok(redirect_msg(&base_path(gid), "too_many_rules"));
+    require_project(&state, pid).await?;
+    if count_rules(&state.db, pid).await? >= MAX_RULES {
+        return Ok(redirect_msg(&base_path(pid), "too_many_rules"));
     }
     let back = |code: &str| {
-        Redirect::to(&format!("{}/rules/new?msg={code}", base_path(gid))).into_response()
+        Redirect::to(&format!("{}/rules/new?msg={code}", base_path(pid))).into_response()
     };
     let rule = match parse_rule_form(&fields, Rule::new()) {
         Ok(r) => r,
         Err(code) => return Ok(back(code)),
     };
-    if tag_taken(&state.db, gid, &rule.tag, 0).await? {
+    if tag_taken(&state.db, pid, &rule.tag, 0).await? {
         return Ok(back("rule_tag_taken"));
     }
-    let id = insert_rule(&state.db, gid, &rule, &user.username).await?;
-    runner::invalidate_preview(&state, gid);
-    tracing::info!(user = %user.username, guild_id = gid, rule = id, tag = %rule.tag, "recurring rule created");
-    Ok(redirect_msg(&rule_path(gid, id), "rule_created"))
+    let id = insert_rule(&state.db, pid, &rule, &user.username).await?;
+    runner::invalidate_preview(&state, pid);
+    tracing::info!(user = %user.username, project_id = pid, rule = id, tag = %rule.tag, "recurring rule created");
+    Ok(redirect_msg(&rule_path(pid, id), "rule_created"))
 }
 
 async fn save_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
     Form(fields): Form<Vec<(String, String)>>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let current = load_rule(&state.db, gid, rid)
+    require_project(&state, pid).await?;
+    let current = load_rule(&state.db, pid, rid)
         .await?
         .ok_or(AppError::NotFound)?;
-    let back = rule_path(gid, rid);
+    let back = rule_path(pid, rid);
     let rule = match parse_rule_form(&fields, current) {
         Ok(r) => r,
         Err(code) => return Ok(redirect_msg(&back, code)),
     };
-    if tag_taken(&state.db, gid, &rule.tag, rid).await? {
+    if tag_taken(&state.db, pid, &rule.tag, rid).await? {
         return Ok(redirect_msg(&back, "rule_tag_taken"));
     }
-    update_rule(&state.db, gid, &rule, &user.username).await?;
-    runner::invalidate_preview(&state, gid);
-    tracing::info!(user = %user.username, guild_id = gid, rule = rid, "recurring rule saved");
+    update_rule(&state.db, pid, &rule, &user.username).await?;
+    runner::invalidate_preview(&state, pid);
+    tracing::info!(user = %user.username, project_id = pid, rule = rid, "recurring rule saved");
     Ok(redirect_msg(&back, "saved"))
 }
 
 async fn remove_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    if !delete_rule(&state.db, gid, rid).await? {
+    require_project(&state, pid).await?;
+    if !delete_rule(&state.db, pid, rid).await? {
         return Err(AppError::NotFound);
     }
-    runner::invalidate_preview(&state, gid);
-    tracing::info!(user = %user.username, guild_id = gid, rule = rid, "recurring rule deleted");
-    Ok(redirect_msg(&base_path(gid), "rule_deleted"))
+    runner::invalidate_preview(&state, pid);
+    tracing::info!(user = %user.username, project_id = pid, rule = rid, "recurring rule deleted");
+    Ok(redirect_msg(&base_path(pid), "rule_deleted"))
 }
 
 #[cfg(test)]

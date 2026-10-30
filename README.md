@@ -1,25 +1,34 @@
-# Scorpio Discord bot
+# Scorpio
 
-Discord bot with a web dashboard. Every module can be switched on or off per server, configured and monitored from the dashboard.
+Automation bot with a web dashboard. Work is grouped in **projects**: every module can be switched on or off per project, configured and monitored from the dashboard. Integrations with other services (Discord, ClickUp) are modules too: each holds a key other modules of the project share, and any module can use its own key instead.
 
 Modules:
 
-- **Greeting**: posts a customizable welcome message to a chosen channel when someone joins the server.
-- **ClickUp**: stores the ClickUp API key other modules can share, matches ClickUp people to server members and maps ClickUp tags to server roles.
+- **Discord**: holds the bot token other modules can share, and the Discord server that bot works in. Shows the bot's status.
+- **ClickUp**: stores the ClickUp API key other modules can share, matches ClickUp people to Discord members and maps ClickUp tags to Discord roles.
+- **Greeting**: posts a customizable welcome message to a chosen channel when someone joins the Discord server.
 - **Calendar**: reads meetings and events from a ClickUp list and posts scheduled agendas and reminders before each event.
 - **Recurring tasks**: moves tagged ClickUp tasks to their next date (or creates a copy there) when ClickUp's own recurrence does not run, for example once a Free plan workspace is out of automations.
+
+## Projects
+
+The overview lists the projects and the Discord bots that are connected. Any account can create and rename projects; only root can delete one, which removes all its settings, keys, logs and statistics. A project's page lists every module with what it uses (Discord, ClickUp) and, for enabled modules, what is missing, like a key or a server.
+
+Keys and tokens are per project. A module that uses a service has a key card on its page: by default it uses the shared key of the service's module (Discord or ClickUp, which must be enabled), or it can keep a key of its own. Several projects or modules with the same Discord bot token share one connection to Discord.
 
 ## Discord setup
 
 1. Create an application at https://discord.com/developers/applications and add a bot.
-2. On the **Bot** tab, enable **Server Members Intent** (required to see members joining, and to match ClickUp people to members).
-3. Copy the bot token into `.env` as `DISCORD_TOKEN`.
-4. Invite the bot with **OAuth2 > URL Generator**: scope `bot`, permissions `View Channels`, `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History` (the last two let the Calendar module add reactions). To let the Calendar module ping roles that are not mentionable, also grant `Mention Everyone` (shown as "Mention @everyone, @here, and All Roles"); the bot still never pings `@everyone` or `@here`.
+2. On the **Bot** tab, enable **Server Members Intent** (required to see members joining, and to match ClickUp people to members), then **Reset Token** and copy it.
+3. Invite the bot with **OAuth2 > URL Generator**: scope `bot`, permissions `View Channels`, `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History` (the last two let the Calendar module add reactions). To let the Calendar module ping roles that are not mentionable, also grant `Mention Everyone` (shown as "Mention @everyone, @here, and All Roles"); the bot still never pings `@everyone` or `@here`.
+4. In the dashboard open the project, then **Discord**: paste the token (it is checked with Discord, stored encrypted and never shown again), pick the server and enable the module.
+
+A module with its own bot token picks its own server the same way on its page. A bot that is in a single server gets it selected right away. If a privileged intent is switched on later, press **Reconnect bot** on the token card.
 
 ## Running
 
 ```sh
-cp .env.example .env   # then fill in DISCORD_TOKEN
+cp .env.example .env   # optional settings, see Configuration
 ```
 
 With Docker, using the prebuilt image from Docker Hub (`scorpioorganization/scorpio-discord-bot`, `linux/amd64` and `linux/arm64`). Only `docker-compose.yml` and `.env` are needed on the host, no source checkout:
@@ -50,37 +59,54 @@ Without Docker:
 cargo run --release
 ```
 
-Open http://localhost:8080 and sign in as `root`. Without `DISCORD_TOKEN` the dashboard still runs and shows the bot as not configured.
+Open http://localhost:8080 and sign in as `root`, create a project and set up the modules it needs. Bot tokens and API keys are entered on the dashboard, not in `.env`.
 
 ### Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DISCORD_TOKEN` | empty | Bot token. Empty means dashboard only. |
+| `DISCORD_TOKEN` | empty | Deprecated. Imported once into the projects created from Discord servers when upgrading to projects (see [Upgrading](#upgrading-to-projects)), ignored afterwards. Bot tokens are set in each project's Discord module. |
 | `DATABASE_URL` | `sqlite://data/scorpio.db?mode=rwc` | SQLite database file. |
 | `WEB_BIND` | `0.0.0.0:8080` | Dashboard listen address. |
 | `COOKIE_SECURE` | `false` | Mark the session cookie Secure. Turn on behind HTTPS. |
 | `TRUST_PROXY` | `false` | Use the last `X-Forwarded-For` entry as client IP for login throttling. |
 | `ROOT_PASSWORD` | empty | Initial root password. Only used when the root account is first created. |
-| `SECRETS_KEY` | empty | 64 hex characters (`openssl rand -hex 32`) used to encrypt stored API keys. Empty means a key is generated once into `secret.key` next to the database; back it up with the database. |
+| `SECRETS_KEY` | empty | 64 hex characters (`openssl rand -hex 32`) used to encrypt stored API keys and bot tokens. Empty means a key is generated once into `secret.key` next to the database; back it up with the database. |
 | `RUST_LOG` | `info` | Log filter. |
 
 ### Accounts
 
 - `root` is created on first start. If `ROOT_PASSWORD` is empty, a random password is printed to the log once.
 - Root creates, deletes and resets passwords of other accounts on the **Users** page. No email is involved.
-- Every account can view statistics and change bot settings. Only root manages accounts.
+- Every account can view statistics, create projects and change settings. Only root manages accounts and deletes projects.
 - Forgot the root password? Run `scorpio-discord-bot reset-root` (Docker: `docker compose run --rm bot reset-root`). It prints a new password and signs root out everywhere.
+
+### Upgrading to projects
+
+Before projects, everything was configured per Discord server and the bot token came from `DISCORD_TOKEN`. The first start of a version with projects upgrades the database on its own, no manual step needed:
+
+1. The database file is copied to `scorpio.db.pre-v7.bak` next to it (only when a migration is pending).
+2. Every Discord server with any settings, logs or statistics becomes a project named after the server (once the bot sees it) with all its settings. Saved ClickUp keys move along and are sealed again for their project.
+3. If `DISCORD_TOKEN` is set, it is stored in the Discord module of each of those projects, with that server selected, and the Discord module is enabled. Everything that used the bot keeps working. This happens once; afterwards `DISCORD_TOKEN` is ignored (the log says so) and can be removed from `.env`. With no server data at all, a project named `Main` gets the token.
+4. Old links (`/guilds/<server id>/...`) redirect to the matching project.
+
+The bot token now lives in the database, encrypted with `SECRETS_KEY` or `secret.key`. Keep `secret.key` backed up together with the database: without it the bot token (and ClickUp keys) have to be entered again.
+
+To roll back, stop the container, put `scorpio.db.pre-v7.bak` back as `scorpio.db`, and run the previous image (`sha-<commit>` tag) with `DISCORD_TOKEN` in `.env`. An older version refuses to start on the upgraded database rather than damaging it.
 
 ### Troubleshooting
 
 - **`Disallowed intent(s)` / close code 4014, or a "Server Members Intent is disabled" warning**: the
   Greeting module needs the privileged Server Members Intent. Enable it on the **Bot** tab of your
-  application in the developer portal, then `docker compose restart bot`. Until then the bot still
-  connects, but without that intent, so members joining are not seen and no greetings are sent. The
-  dashboard shows the same warning on the overview, server and Greeting pages.
-- **`DISCORD_TOKEN was rejected by Discord`**: the token is wrong or was reset. Copy a new one from
-  the **Bot** tab into `.env` and restart. The dashboard keeps running and shows the error.
+  application in the developer portal, then press **Reconnect bot** on the Discord module's token
+  card. Until then the bot still connects, but without that intent, so members joining are not seen
+  and no greetings are sent. The dashboard shows the same warning on the overview, project and module
+  pages.
+- **"Discord rejected the bot token"**: the token is wrong or was reset. Copy a new one from the
+  **Bot** tab and save it on the Discord module's page. The dashboard keeps running and shows the
+  error; a rejected token is not tried again until it is replaced.
+- **"The saved Discord bot token cannot be decrypted"**: `SECRETS_KEY` changed, or `secret.key` was
+  lost or replaced. Save the token again on the Discord module's page.
 - **"The saved ClickUp API key cannot be decrypted"**: `SECRETS_KEY` changed, or `secret.key` was lost
   or replaced. Save the API key again on the ClickUp (or Calendar) page.
 - **The calendar posts nothing**: check, in this order, that the Calendar module is enabled, a ClickUp
@@ -96,7 +122,7 @@ Open http://localhost:8080 and sign in as `root`. Without `DISCORD_TOKEN` the da
 
 ## Greeting module
 
-Configured per server under **Overview > server > Greeting**:
+Configured per project under **Overview > project > Greeting**:
 
 - channel, message template, plain text or embed (with color), whether to greet bots
 - live preview while editing and a **Send test message** button
@@ -119,18 +145,18 @@ Only the joining member can ever be pinged. `@everyone`, `@here` and role mentio
 
 The bot reads ClickUp with a personal API key: in ClickUp open your avatar, **Settings**, **Apps** and copy the **API Token** (it starts with `pk_`). The key acts as your ClickUp account, so the bot sees what you can see. It only ever reads; the ClickUp client in the bot has no way to create, change or delete anything.
 
-When a key is saved it is first checked with ClickUp, then stored encrypted (XChaCha20-Poly1305). The dashboard never shows it again, only the ClickUp account name and the last four characters.
+When a key is saved it is first checked with ClickUp, then stored encrypted (XChaCha20-Poly1305), like Discord bot tokens. The dashboard never shows it again, only the ClickUp account name and the last four characters.
 
-The encryption key comes from `SECRETS_KEY` (64 hex characters, `openssl rand -hex 32`). Without it, a random key is created once in `secret.key` next to the database (`./data/secret.key` with Docker). Back that file up together with the database. If `SECRETS_KEY` or `secret.key` changes, saved API keys can no longer be read and have to be entered again; nothing else is affected.
+The encryption key comes from `SECRETS_KEY` (64 hex characters, `openssl rand -hex 32`). Without it, a random key is created once in `secret.key` next to the database (`./data/secret.key` with Docker). Back that file up together with the database. If `SECRETS_KEY` or `secret.key` changes, saved API keys and bot tokens can no longer be read and have to be entered again; nothing else is affected.
 
 ## ClickUp module
 
-Configured per server under **Overview > server > ClickUp**:
+Configured per project under **Overview > project > ClickUp**:
 
 - **API key**: the shared key other ClickUp modules use by default. Those modules can also keep a separate key of their own. Other modules can only use the shared key while this module is enabled.
 - **Workspace**: the ClickUp workspace whose people are listed for matching.
-- **People**: every person of the workspace with the server member they are matched to.
-- **Tags to roles**: ClickUp tags (those of the workspace's spaces, or typed in) mapped to server roles. Modules use them for the `{roles}` placeholder. Tags are matched ignoring case.
+- **People**: every person of the workspace with the Discord member they are matched to, in the server of the project's Discord module.
+- **Tags to roles**: ClickUp tags (those of the workspace's spaces, or typed in) mapped to roles of that server. Modules use them for the `{roles}` placeholder. Tags are matched ignoring case. Editing needs the Discord bot connected.
 
 People are matched to server members by name automatically. Accents, dots, underscores and word order are ignored (`Igor Zawórski` matches `igor_zaworski` and `Zaworski Igor`), the email address before the `@` counts too, and small typos are tolerated. A first name alone is never enough, and when two members fit equally well the person stays unmatched instead of guessing. Each member is matched to at most one person.
 
@@ -138,11 +164,11 @@ To pin a person, type a Discord username, display name, `@name`, user ID or `<@i
 
 ## Calendar module
 
-Configured per server under **Overview > server > Calendar**. The bot reads one ClickUp list (the list behind your calendar or board) and never changes it.
+Configured per project under **Overview > project > Calendar**. The bot reads one ClickUp list (the list behind your calendar or board) and never changes it.
 
 **Source**: the list (picked from your workspaces, or pasted as an ID or list URL), whether an event happens at its due date or its start date (falling back to the due date), the default time zone (for new digest rules and the times shown on the page), an optional tag filter (tasks with any of up to 5 tags), and whether subtasks and closed tasks count. Tasks without the chosen date are ignored.
 
-**Rules** (up to 20 per server), each with its own channel:
+**Rules** (up to 20 per project), each with its own channel:
 
 - **Digest**: on the chosen weekdays at a time of day in the rule's own time zone, posts the events of the next N hours, either as one message listing them or as one message per event. The optional header starts the listing message, or is posted as its own first message in the one message per event layout. The window can start a number of minutes after the scheduled time: posting at 20:00, skipping 240 minutes and including 24 hours lists the events of the next day (00:00 to 24:00). Optionally posts a message when there are no events. A new digest rule takes the time zone of your browser (or the server default without JavaScript).
 - **Reminder**: posts once for every event, a set number of minutes before it starts. If the event is moved, it is reminded again before the new time.
@@ -179,11 +205,11 @@ Behavior worth knowing:
 
 ## Recurring tasks module
 
-Configured per server under **Overview > server > Recurring tasks**. This is the only module that changes anything in ClickUp. ClickUp's API does not show or set a task's recurrence settings, so the rules live in the dashboard: each rule maps a ClickUp tag to an interval, and tasks with that tag recur. Tag a task to make it recur, remove the tag to stop it. Remove ClickUp's own recurrence from tagged tasks, otherwise a task can be moved twice.
+Configured per project under **Overview > project > Recurring tasks**. This is the only module that changes anything in ClickUp. ClickUp's API does not show or set a task's recurrence settings, so the rules live in the dashboard: each rule maps a ClickUp tag to an interval, and tasks with that tag recur. Tag a task to make it recur, remove the tag to stop it. Remove ClickUp's own recurrence from tagged tasks, otherwise a task can be moved twice.
 
 **Settings**: the ClickUp workspace searched for tagged tasks (all its lists), the time zone intervals are counted in, how often to check (5 to 1440 minutes, default 15) and **dry run**. Dry run is on until you turn it off: runs then only log what they would change.
 
-**Rules** (up to 20 per server, one per tag):
+**Rules** (up to 20 per project, one per tag):
 
 - **Repeat every** N days, weeks, months or years.
 - **Recur when done** (the task is in a done or closed status) or **when due** (its due date passed, done or not).
@@ -197,7 +223,7 @@ Behavior worth knowing:
 - Leaving out a date's time keeps whether ClickUp shows a time. Copies of tasks due at 04:00 in the configured time zone (how ClickUp stores a date without a time) get a date without a time.
 - At most 25 tasks change per run, the rest follow in later runs. Every occurrence (task and due date) is handled once, even if a copy's original stays overdue.
 - A change ClickUp refuses (for example a status name that does not exist in the task's list) is logged and counted once, and retried on later runs. A copy that fails without a clear answer (timeout, ClickUp server error) is not retried, because ClickUp may have created it anyway: check the task in ClickUp.
-- Scheduled runs need the bot connected to Discord. **Run now** on the module page works anyway, and the page previews which tasks the next run would change.
+- It needs no Discord bot: runs happen on schedule whenever the module is enabled. **Run now** on the module page starts one at once, and the page previews which tasks the next run would change.
 - The page shows the rules, statistics (moved, copied, failed, ClickUp errors), the last and next run, the preview and recent activity.
 
 ## Security notes
@@ -206,19 +232,19 @@ Behavior worth knowing:
 - Every state changing request requires a per session CSRF token.
 - Login is throttled per IP (5 failures in 15 minutes) and per username (20 failures).
 - Strict Content Security Policy, no inline scripts or styles, frame embedding denied.
-- Third party API keys are encrypted at rest with a key that is not in the database, write-only in the dashboard and never logged.
+- Third party API keys and Discord bot tokens are encrypted at rest with a key that is not in the database, bound to their project and owner, write-only in the dashboard and never logged.
 - ClickUp access is read-only except for the Recurring tasks module: the client's only write calls change a task's status and dates or create a task, and only that module uses them. It starts in dry run mode and changes at most 25 tasks per run.
 - Messages restrict pings to the users and roles a module explicitly allows, never `@everyone` or `@here`.
 
 ## Adding a module
 
-1. Create `src/modules/<name>/` and implement the `Module` trait from `src/modules/mod.rs` (id, name, description, summary stats, dashboard routes, event hooks).
+1. Create `src/modules/<name>/` and implement the `Module` trait from `src/modules/mod.rs` (id, name, description, the services it uses, summary stats, dashboard routes, event hooks).
 2. Register it in `modules::registry()`.
-3. Add its tables in a new file under `migrations/`.
+3. Add its tables, with a `project_id` column, in a new file under `migrations/`, and list them in `projects::TABLES` so deleting a project removes them (a test checks the list against the schema).
 
-The guild page lists the module with an enable/disable switch automatically, and the bot only calls its hooks in servers where it is enabled. Modules that work on a schedule return `true` from `ticks()` and get `on_tick` about once a minute per server.
+The project page lists the module with an enable/disable switch automatically, and its hooks only run in projects where it is enabled. Modules that work on a schedule return `true` from `ticks()` and get `on_tick` about once a minute per project.
 
-A module that uses ClickUp reuses the shared pieces instead of handling keys itself: `clickup::web::token_routes("<id>")` and `templates/clickup/token_card.html` give it the API key card (shared or own key), `clickup::tokens::resolve` and `track` give it a key and record each call, `modules::clickup::resolver` matches ClickUp people to members and `modules::clickup::tag_roles` gives the tag to role mappings. The Calendar module is the example.
+A module that uses a service reuses the shared pieces instead of handling keys itself: `keys::web::key_routes(Service::<X>, "<id>")`, `keys::web::key_view` and `templates/keys/cards.html` give it the key card (shared or own key, plus the server for Discord), `keys::resolve` and `track` give it a key and record each call. For Discord, `discord::connection::connection(state, project, "<id>")` gives the connected bot and server the module uses, and listing `Service::Discord` in `services()` keeps that bot connected while the module is enabled. `modules::clickup::resolver` matches ClickUp people to members and `modules::clickup::tag_roles` gives the tag to role mappings. The Calendar module uses both services and is the example.
 
 ## Development
 

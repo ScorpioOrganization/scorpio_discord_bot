@@ -1,9 +1,10 @@
-//! Calls [`Module::on_tick`] about once a minute for every guild a ticking module is
-//! enabled in. A slow or failing guild never blocks the others or stops the loop.
+//! Calls [`Module::on_tick`] about once a minute for every project a ticking module is
+//! enabled in. A slow or failing project never blocks the others or stops the loop.
+//!
+//! [`Module::on_tick`]: crate::modules::Module::on_tick
 
 use std::time::Duration;
 
-use serenity::all::GuildId;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
@@ -11,7 +12,7 @@ use crate::modules;
 use crate::state::AppState;
 
 pub const TICK: Duration = Duration::from_secs(60);
-/// Upper bound for one module's work in one guild.
+/// Upper bound for one module's work in one project.
 const TICK_TIMEOUT: Duration = Duration::from_secs(50);
 
 pub async fn run(state: AppState) {
@@ -23,33 +24,30 @@ pub async fn run(state: AppState) {
     }
 }
 
-/// One round: every ticking module, every enabled guild the bot is in, concurrently.
+/// One round: every ticking module, every project it is enabled in, concurrently.
 pub async fn tick_once(state: &AppState) {
-    let Some(discord) = state.discord() else {
-        return;
-    };
     let mut tasks = JoinSet::new();
     for module in state.modules.iter().filter(|m| m.ticks()) {
-        let guilds = match modules::enabled_guilds(&state.db, module.id()).await {
-            Ok(g) => g,
+        let projects = match modules::enabled_projects(&state.db, module.id()).await {
+            Ok(p) => p,
             Err(e) => {
-                tracing::error!(module = module.id(), "could not list enabled guilds: {e:#}");
+                tracing::error!(
+                    module = module.id(),
+                    "could not list enabled projects: {e:#}"
+                );
                 continue;
             }
         };
-        for guild_id in guilds {
-            if guild_id == 0 || discord.cache.guild(GuildId::new(guild_id)).is_none() {
-                continue;
-            }
-            let (module, state, discord) = (module.clone(), state.clone(), discord.clone());
+        for project_id in projects {
+            let (module, state) = (module.clone(), state.clone());
             tasks.spawn(async move {
-                let work = module.on_tick(&state, &discord, guild_id);
+                let work = module.on_tick(&state, project_id);
                 match tokio::time::timeout(TICK_TIMEOUT, work).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        tracing::error!(module = module.id(), guild_id, "tick failed: {e:#}")
+                        tracing::error!(module = module.id(), project_id, "tick failed: {e:#}")
                     }
-                    Err(_) => tracing::warn!(module = module.id(), guild_id, "tick timed out"),
+                    Err(_) => tracing::warn!(module = module.id(), project_id, "tick timed out"),
                 }
             });
         }
@@ -71,13 +69,13 @@ mod tests {
 
     use super::*;
     use crate::modules::{Module, StatItem, set_enabled};
-    use crate::state::DiscordHandle;
     use crate::test_util;
 
     #[derive(Default)]
     struct Recorder {
-        ticks: Mutex<Vec<u64>>,
+        ticks: Mutex<Vec<i64>>,
         ticking: bool,
+        failing: Mutex<Option<i64>>,
     }
 
     struct Probe(Arc<Recorder>, &'static str);
@@ -93,7 +91,7 @@ mod tests {
         fn description(&self) -> &'static str {
             ""
         }
-        async fn summary(&self, _: &AppState, _: u64) -> Result<Vec<StatItem>> {
+        async fn summary(&self, _: &AppState, _: i64) -> Result<Vec<StatItem>> {
             Ok(Vec::new())
         }
         fn routes(&self) -> Router<AppState> {
@@ -102,9 +100,9 @@ mod tests {
         fn ticks(&self) -> bool {
             self.0.ticking
         }
-        async fn on_tick(&self, _: &AppState, _: &DiscordHandle, guild_id: u64) -> Result<()> {
-            self.0.ticks.lock().unwrap().push(guild_id);
-            if guild_id == test_util::GUILD_ID {
+        async fn on_tick(&self, _: &AppState, project_id: i64) -> Result<()> {
+            self.0.ticks.lock().unwrap().push(project_id);
+            if *self.0.failing.lock().unwrap() == Some(project_id) {
                 anyhow::bail!("errors are logged, not fatal");
             }
             Ok(())
@@ -112,7 +110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticks_enabled_guilds_the_bot_is_in() {
+    async fn ticks_enabled_projects_without_discord() {
         let ticking = Arc::new(Recorder {
             ticking: true,
             ..Default::default()
@@ -123,28 +121,19 @@ mod tests {
             Arc::new(Probe(silent.clone(), "silent")),
         ];
         let state = test_util::state_with(modules).await;
+        let [a, b, c] = test_util::projects(&state.db, ["A", "B", "C"]).await;
 
-        // Not connected: nothing runs.
-        set_enabled(&state.db, test_util::GUILD_ID, "probe", true)
-            .await
-            .unwrap();
-        tick_once(&state).await;
-        assert!(ticking.ticks.lock().unwrap().is_empty());
-
-        test_util::connect_fake_discord(&state);
-        let other = test_util::GUILD_ID + 1;
-        set_enabled(&state.db, other, "probe", true).await.unwrap();
-        set_enabled(&state.db, test_util::GUILD_ID, "silent", true)
-            .await
-            .unwrap();
+        set_enabled(&state.db, a, "probe", true).await.unwrap();
+        set_enabled(&state.db, b, "probe", true).await.unwrap();
+        set_enabled(&state.db, c, "silent", true).await.unwrap();
+        *ticking.failing.lock().unwrap() = Some(a);
         tick_once(&state).await;
         tick_once(&state).await;
 
-        // The bot is not in `other`, and `silent` does not tick.
-        assert_eq!(
-            *ticking.ticks.lock().unwrap(),
-            [test_util::GUILD_ID, test_util::GUILD_ID]
-        );
+        // A failing project does not stop the others; `silent` does not tick.
+        let mut ticks = ticking.ticks.lock().unwrap().clone();
+        ticks.sort();
+        assert_eq!(ticks, [a, a, b, b]);
         assert!(silent.ticks.lock().unwrap().is_empty());
     }
 }

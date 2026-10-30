@@ -15,49 +15,57 @@ use super::{
     save_workspace, set_mapping, set_tag_role, tag_role_rows,
 };
 use crate::auth::extract::CurrentUser;
-use crate::bot::info::{self, GuildSummary, RoleOption};
-use crate::bot::members::{MemberInfo, guild_members};
 use crate::clickup::ClickUpError;
 use crate::clickup::client::{Team, User};
 use crate::clickup::mapping::{Explicit, Resolution, Resolver};
-use crate::clickup::tokens::{self, Credential, TokenProblem};
-use crate::clickup::web::{TokenView, token_routes, token_view};
+use crate::discord::connection::{Conn, connection};
+use crate::discord::info::{self, RoleOption};
+use crate::discord::members::{MemberInfo, guild_members};
 use crate::error::{AppError, AppResult};
+use crate::keys::web::{KeyView, key_routes, key_view};
+use crate::keys::{self, Credential, KeyProblem, Service};
 use crate::modules::{self, counter};
+use crate::projects::Project;
 use crate::state::AppState;
-use crate::web::{MsgQuery, PageCtx, redirect_msg, require_guild};
+use crate::web::{MsgQuery, PageCtx, redirect_msg, require_project};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/guilds/{gid}/modules/clickup", get(page))
-        .route("/guilds/{gid}/modules/clickup/test", post(test_key))
+        .route("/projects/{pid}/modules/clickup", get(page))
+        .route("/projects/{pid}/modules/clickup/test", post(test_key))
         .route(
-            "/guilds/{gid}/modules/clickup/workspace",
+            "/projects/{pid}/modules/clickup/workspace",
             post(choose_workspace),
         )
-        .route("/guilds/{gid}/modules/clickup/mapping", post(save_mapping))
         .route(
-            "/guilds/{gid}/modules/clickup/tag-roles",
+            "/projects/{pid}/modules/clickup/mapping",
+            post(save_mapping),
+        )
+        .route(
+            "/projects/{pid}/modules/clickup/tag-roles",
             post(save_tag_roles),
         )
         .route(
-            "/guilds/{gid}/modules/clickup/members/refresh",
+            "/projects/{pid}/modules/clickup/members/refresh",
             post(refresh_members),
         )
-        .merge(token_routes(ID))
+        .merge(key_routes(Service::ClickUp, ID))
 }
 
 const TAGS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const TAGS_MAX_SPACES: usize = 20;
 
-fn base_path(gid: u64) -> String {
-    format!("/guilds/{gid}/modules/{ID}")
+fn base_path(pid: i64) -> String {
+    format!("/projects/{pid}/modules/{ID}")
 }
 
-fn guild_roles(state: &AppState, gid: u64) -> Vec<RoleOption> {
-    state
-        .discord()
-        .map(|d| info::roles(&d.cache, gid))
+/// The shared Discord bot of the project, whose server the mappings refer to.
+async fn discord(state: &AppState, pid: i64) -> anyhow::Result<Option<Conn>> {
+    Ok(connection(state, pid, ID).await?.ok())
+}
+
+fn guild_roles(conn: Option<&Conn>) -> Vec<RoleOption> {
+    conn.map(|c| info::roles(&c.handle.cache, c.guild_id))
         .unwrap_or_default()
 }
 
@@ -95,10 +103,10 @@ struct TagRow {
 #[template(path = "modules/clickup.html")]
 struct ClickUpPage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
     enabled: bool,
     warnings: Vec<String>,
-    token: TokenView,
+    keys: Vec<KeyView>,
     has_key: bool,
     teams: Vec<TeamOption>,
     team_error: Option<String>,
@@ -109,46 +117,50 @@ struct ClickUpPage {
     tag_rows: Vec<TagRow>,
     tag_error: Option<String>,
     roles: Vec<RoleOption>,
+    /// The shared Discord bot is connected, so roles can be listed and tag roles edited.
+    discord_ready: bool,
     api_ok: i64,
     api_err: i64,
 }
 
 /// The shared key, with the dashboard redirect to show when there is none.
-async fn credential(state: &AppState, gid: u64) -> AppResult<Result<Credential, &'static str>> {
-    Ok(tokens::resolve(state, gid, ID).await?.map_err(|p| match p {
-        TokenProblem::Unreadable => "token_unreadable",
-        _ => "token_missing",
-    }))
+async fn credential(state: &AppState, pid: i64) -> AppResult<Result<Credential, &'static str>> {
+    Ok(keys::resolve(state, pid, Service::ClickUp, ID)
+        .await?
+        .map_err(|p| match p {
+            KeyProblem::Unreadable => "token_unreadable",
+            _ => "token_missing",
+        }))
 }
 
 async fn fetch_teams(
     state: &AppState,
-    gid: u64,
+    pid: i64,
     cred: &Credential,
 ) -> Result<Vec<Team>, ClickUpError> {
     let result = state.clickup.teams(&cred.token).await;
-    tokens::track(&state.db, gid, ID, cred, result).await
+    keys::track(&state.db, pid, ID, cred, result).await
 }
 
 /// Tag names (normalized) of every space in a workspace, sorted. API calls count for
 /// `module_id`.
 pub(crate) async fn workspace_tags(
     state: &AppState,
-    gid: u64,
+    pid: i64,
     module_id: &str,
     cred: &Credential,
     team_id: &str,
 ) -> Result<Arc<Vec<String>>, ClickUpError> {
     // Keyed by the key itself, so a replaced key never shows the old account's tags.
     let fingerprint = &crate::auth::hash_token(cred.token.expose())[..16];
-    let key = format!("clickup:tags:{gid}:{team_id}:{fingerprint}");
+    let key = format!("clickup:tags:{pid}:{team_id}:{fingerprint}");
     if let Some(hit) = state.cache.get::<Vec<String>>(&key, TAGS_MAX_AGE) {
         return Ok(hit);
     }
     let (db, client, token) = (&state.db, &state.clickup, &cred.token);
-    let spaces = tokens::track(
+    let spaces = keys::track(
         db,
-        gid,
+        pid,
         module_id,
         cred,
         client.spaces(token, team_id).await,
@@ -157,7 +169,7 @@ pub(crate) async fn workspace_tags(
     let mut names = HashSet::new();
     for space in spaces.iter().take(TAGS_MAX_SPACES) {
         let result = client.space_tags(token, &space.id).await;
-        let tags = tokens::track(db, gid, module_id, cred, result).await?;
+        let tags = keys::track(db, pid, module_id, cred, result).await?;
         names.extend(tags.iter().filter_map(|t| normalize_tag(t.name())));
     }
     let mut names: Vec<String> = names.into_iter().collect();
@@ -165,20 +177,21 @@ pub(crate) async fn workspace_tags(
     Ok(state.cache.insert(key, names))
 }
 
-pub(crate) fn invalidate_tags(state: &AppState, gid: u64) {
-    state.cache.remove_prefix(&format!("clickup:tags:{gid}:"));
+pub(crate) fn invalidate_tags(state: &AppState, pid: i64) {
+    state.cache.remove_prefix(&format!("clickup:tags:{pid}:"));
 }
 
 async fn page(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(&state, gid)?;
-    let enabled = modules::is_enabled(&state.db, gid, ID).await?;
-    let token = token_view(&state, gid, ID).await?;
-    let cfg = load_config(&state.db, gid).await?;
+    let project = require_project(&state, pid).await?;
+    let enabled = modules::is_enabled(&state.db, pid, ID).await?;
+    let keys = vec![key_view(&state, pid, Service::ClickUp, ID).await?];
+    let cfg = load_config(&state.db, pid).await?;
+    let conn = discord(&state, pid).await?;
 
     let mut warnings = Vec::new();
     if !enabled {
@@ -188,23 +201,27 @@ async fn page(
                 .to_owned(),
         );
     }
-    if !state
-        .missing_intents(GatewayIntents::GUILD_MEMBERS)
-        .is_empty()
-    {
-        warnings.push(
+    match &conn {
+        Some(c) if !c.handle.intents.contains(GatewayIntents::GUILD_MEMBERS) => warnings.push(
             "Server Members Intent is disabled in the Discord developer portal, so the member \
              list may be incomplete and automatic matching can miss people. Enable it on the \
-             Bot tab of your application and restart the bot."
+             Bot tab of your application and reconnect the bot."
                 .to_owned(),
-        );
+        ),
+        Some(_) => {}
+        None => warnings.push(
+            "The shared Discord bot of this project is not available (see the Discord module), \
+             so Discord members and roles cannot be listed. Mappings by user ID still work; \
+             tag roles can be edited once the bot is back."
+                .to_owned(),
+        ),
     }
 
     let mut teams = Vec::new();
     let mut team_error = None;
-    let cred = credential(&state, gid).await?;
+    let cred = credential(&state, pid).await?;
     if let Ok(cred) = &cred {
-        match fetch_teams(&state, gid, cred).await {
+        match fetch_teams(&state, pid, cred).await {
             Ok(t) => teams = t,
             Err(e) => team_error = Some(e.to_string()),
         }
@@ -223,23 +240,29 @@ async fn page(
     let workspace_people: Vec<User> = selected
         .map(|t| t.members.iter().map(|m| m.user.clone()).collect())
         .unwrap_or_default();
-    let members = guild_members(&state, gid).await;
-    let people = person_rows(&state, gid, workspace_people, &members).await?;
+    let members = guild_members(&state, conn.as_ref()).await;
+    let people = person_rows(&state, pid, workspace_people, &members).await?;
 
-    let roles = guild_roles(&state, gid);
+    let roles = guild_roles(conn.as_ref());
     let mut tag_error = None;
     let mut known_tags = Vec::new();
     if let (Ok(cred), Some(team)) = (&cred, selected) {
-        match workspace_tags(&state, gid, ID, cred, &team.id).await {
+        match workspace_tags(&state, pid, ID, cred, &team.id).await {
             Ok(tags) => known_tags = tags.to_vec(),
             Err(e) => tag_error = Some(e.to_string()),
         }
     }
-    let tag_rows = tag_rows(&state, gid, known_tags, &roles).await?;
+    let tag_rows = tag_rows(
+        &state,
+        pid,
+        known_tags,
+        conn.as_ref().map(|_| roles.as_slice()),
+    )
+    .await?;
 
     let page = ClickUpPage {
-        page: PageCtx::new(&user, "guilds", &msg),
-        guild,
+        page: PageCtx::new(&user, "projects", &msg),
+        project,
         enabled,
         warnings,
         has_key: cred.is_ok(),
@@ -265,21 +288,23 @@ async fn page(
         tag_rows,
         tag_error,
         roles,
-        token,
-        api_ok: counter(&state.db, Some(gid), ID, "api_ok").await?,
-        api_err: counter(&state.db, Some(gid), ID, "api_err").await?,
+        discord_ready: conn.is_some(),
+        keys,
+        api_ok: counter(&state.db, Some(pid), ID, "api_ok").await?,
+        api_err: counter(&state.db, Some(pid), ID, "api_err").await?,
     };
     Ok(Html(page.render()?))
 }
 
-/// Workspace tags plus every mapped tag, sorted.
+/// Workspace tags plus every mapped tag, sorted. Mapped roles missing from `roles` are
+/// marked deleted; with no role list (no Discord) none are.
 async fn tag_rows(
     state: &AppState,
-    gid: u64,
+    pid: i64,
     known: Vec<String>,
-    roles: &[RoleOption],
+    roles: Option<&[RoleOption]>,
 ) -> AppResult<Vec<TagRow>> {
-    let mapped: HashMap<String, u64> = tag_role_rows(&state.db, gid)
+    let mapped: HashMap<String, u64> = tag_role_rows(&state.db, pid)
         .await?
         .into_iter()
         .map(|r| (r.tag, r.role_id as u64))
@@ -292,7 +317,8 @@ async fn tag_rows(
         .into_iter()
         .map(|tag| {
             let role_id = mapped.get(&tag).copied().unwrap_or_default();
-            let deleted = role_id != 0 && !roles.iter().any(|r| r.id == role_id);
+            let deleted =
+                role_id != 0 && roles.is_some_and(|roles| !roles.iter().any(|r| r.id == role_id));
             TagRow {
                 tag,
                 role_id: if deleted { 0 } else { role_id },
@@ -305,11 +331,11 @@ async fn tag_rows(
 /// Workspace members plus anyone with a saved mapping, with their current match.
 async fn person_rows(
     state: &AppState,
-    gid: u64,
+    pid: i64,
     mut people: Vec<User>,
     members: &[MemberInfo],
 ) -> AppResult<Vec<PersonRow>> {
-    let rows = mapping_rows(&state.db, gid).await?;
+    let rows = mapping_rows(&state.db, pid).await?;
     let known: HashSet<i64> = people.iter().map(|p| p.id).collect();
     for row in &rows {
         if !known.contains(&row.clickup_user_id) {
@@ -375,19 +401,17 @@ async fn person_rows(
 async fn test_key(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
-    let cred = match credential(&state, gid).await? {
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
+    let cred = match credential(&state, pid).await? {
         Ok(c) => c,
         Err(code) => return Ok(redirect_msg(&back, code)),
     };
     let result = state.clickup.user(&cred.token).await;
-    let ok = tokens::track(&state.db, gid, ID, &cred, result)
-        .await
-        .is_ok();
-    tracing::info!(user = %user.username, guild_id = gid, ok, "ClickUp key checked");
+    let ok = keys::track(&state.db, pid, ID, &cred, result).await.is_ok();
+    tracing::info!(user = %user.username, project_id = pid, ok, "ClickUp key checked");
     Ok(redirect_msg(
         &back,
         if ok { "token_ok" } else { "token_check_failed" },
@@ -402,29 +426,29 @@ struct WorkspaceForm {
 async fn choose_workspace(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(form): Form<WorkspaceForm>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
     let team_id = form.team_id.trim();
     if team_id.is_empty() {
-        save_workspace(&state.db, gid, None, &user.username).await?;
+        save_workspace(&state.db, pid, None, &user.username).await?;
         return Ok(redirect_msg(&back, "workspace_saved"));
     }
-    let cred = match credential(&state, gid).await? {
+    let cred = match credential(&state, pid).await? {
         Ok(c) => c,
         Err(code) => return Ok(redirect_msg(&back, code)),
     };
-    let Ok(teams) = fetch_teams(&state, gid, &cred).await else {
+    let Ok(teams) = fetch_teams(&state, pid, &cred).await else {
         return Ok(redirect_msg(&back, "clickup_unreachable"));
     };
     let Some(team) = teams.iter().find(|t| t.id == team_id) else {
         return Ok(redirect_msg(&back, "workspace_invalid"));
     };
-    save_workspace(&state.db, gid, Some((&team.id, &team.name)), &user.username).await?;
-    invalidate_tags(&state, gid);
-    tracing::info!(user = %user.username, guild_id = gid, team = %team.id, "ClickUp workspace selected");
+    save_workspace(&state.db, pid, Some((&team.id, &team.name)), &user.username).await?;
+    invalidate_tags(&state, pid);
+    tracing::info!(user = %user.username, project_id = pid, team = %team.id, "ClickUp workspace selected");
     Ok(redirect_msg(&back, "workspace_saved"))
 }
 
@@ -471,11 +495,11 @@ fn parse_target(raw: &str, members: &[MemberInfo]) -> Option<Option<Explicit>> {
 async fn save_mapping(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(fields): Form<Vec<(String, String)>>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
     let names: HashMap<&str, &str> = fields
         .iter()
         .filter_map(|(k, v)| Some((k.strip_prefix("name_")?, v.as_str())))
@@ -493,9 +517,10 @@ async fn save_mapping(
         return Err(AppError::BadRequest);
     }
 
-    let members = guild_members(&state, gid).await;
+    let conn = discord(&state, pid).await?;
+    let members = guild_members(&state, conn.as_ref()).await;
     let mut changes = Vec::new();
-    let current = explicit_mappings(&state.db, gid).await?;
+    let current = explicit_mappings(&state.db, pid).await?;
     for (id, raw) in inputs {
         let Some(target) = parse_target(raw, &members) else {
             return Ok(redirect_msg(&back, "mapping_unknown"));
@@ -514,21 +539,23 @@ async fn save_mapping(
         }
     }
     for (id, name, target) in &changes {
-        set_mapping(&state.db, gid, *id, name, *target, &user.username).await?;
+        set_mapping(&state.db, pid, *id, name, *target, &user.username).await?;
     }
-    tracing::info!(user = %user.username, guild_id = gid, changed = changes.len(), "ClickUp mappings saved");
+    tracing::info!(user = %user.username, project_id = pid, changed = changes.len(), "ClickUp mappings saved");
     Ok(redirect_msg(&back, "mapping_saved"))
 }
 
 async fn refresh_members(
     State(state): State<AppState>,
     CurrentUser(_user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    state.members.invalidate(gid);
-    invalidate_tags(&state, gid);
-    Ok(redirect_msg(&base_path(gid), "members_refreshed"))
+    require_project(&state, pid).await?;
+    if let Some(conn) = discord(&state, pid).await? {
+        state.members.invalidate(conn.guild_id);
+    }
+    invalidate_tags(&state, pid);
+    Ok(redirect_msg(&base_path(pid), "members_refreshed"))
 }
 
 /// Saves the tag to role table plus the "other tag" row. An empty role removes a mapping.
@@ -536,11 +563,11 @@ async fn refresh_members(
 async fn save_tag_roles(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(fields): Form<Vec<(String, String)>>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
     let get = |key: &str| {
         fields
             .iter()
@@ -562,7 +589,11 @@ async fn save_tag_roles(
         return Err(AppError::BadRequest);
     }
 
-    let known: HashSet<u64> = guild_roles(&state, gid).iter().map(|r| r.id).collect();
+    let Some(conn) = discord(&state, pid).await? else {
+        // Without the role list every mapping would look removed.
+        return Ok(redirect_msg(&back, "bot_offline"));
+    };
+    let known: HashSet<u64> = guild_roles(Some(&conn)).iter().map(|r| r.id).collect();
     let mut wanted: HashMap<String, Option<u64>> = HashMap::new();
     for (tag_raw, role_raw) in inputs {
         let Some(tag) = normalize_tag(tag_raw) else {
@@ -578,7 +609,7 @@ async fn save_tag_roles(
         wanted.insert(tag, role);
     }
 
-    let current: HashMap<String, u64> = tag_role_rows(&state.db, gid)
+    let current: HashMap<String, u64> = tag_role_rows(&state.db, pid)
         .await?
         .into_iter()
         .map(|r| (r.tag, r.role_id as u64))
@@ -600,9 +631,9 @@ async fn save_tag_roles(
         return Ok(redirect_msg(&back, "too_many_tag_roles"));
     }
     for (tag, role) in &changes {
-        set_tag_role(&state.db, gid, tag, *role, &user.username).await?;
+        set_tag_role(&state.db, pid, tag, *role, &user.username).await?;
     }
-    tracing::info!(user = %user.username, guild_id = gid, changed = changes.len(), "ClickUp tag roles saved");
+    tracing::info!(user = %user.username, project_id = pid, changed = changes.len(), "ClickUp tag roles saved");
     Ok(redirect_msg(&back, "tag_roles_saved"))
 }
 

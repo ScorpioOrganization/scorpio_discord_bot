@@ -11,7 +11,7 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
 use super::client::User;
-use crate::bot::members::MemberInfo;
+use crate::discord::members::MemberInfo;
 
 /// How much better the best candidate must score than the next one.
 const MARGIN: f64 = 0.03;

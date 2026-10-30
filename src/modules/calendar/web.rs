@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serenity::all::GatewayIntents;
 
 use super::events::{self, FetchError};
-use super::reactions::{self, EmojiOption};
+use super::reactions::{self, EmojiOption, Reaction};
 use super::render::{HEADER_PLACEHOLDERS, ITEM_PLACEHOLDERS};
 use super::runner::{self, DiscordOutbox, TestOutcome};
 use super::schedule::{self, DAY_NAMES};
@@ -21,15 +21,18 @@ use super::{
     recent_log, save_config, update_rule, was_sent,
 };
 use crate::auth::extract::CurrentUser;
-use crate::bot::info::{self, ChannelOption, GuildSummary, RoleOption};
 use crate::clickup::ClickUpError;
-use crate::clickup::tokens::{self, Credential};
-use crate::clickup::web::{TokenView, token_routes, token_view};
 use crate::db::now;
+use crate::discord::connection::{Conn, connection};
+use crate::discord::info::{self, ChannelOption, RoleOption, channel_choices};
+use crate::discord::members::guild_members;
 use crate::error::{AppError, AppResult};
+use crate::keys::web::{KeyView, key_routes, key_view};
+use crate::keys::{self, Credential, Service};
 use crate::modules::{self, clickup, counter, text};
+use crate::projects::Project;
 use crate::state::AppState;
-use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_guild};
+use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_project};
 
 const UPCOMING_SECS: i64 = 7 * 86400;
 const UPCOMING_MAX: usize = 20;
@@ -40,54 +43,52 @@ const CATALOG_MAX_SPACES: usize = 20;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/guilds/{gid}/modules/calendar",
+            "/projects/{pid}/modules/calendar",
             get(page).post(save_source),
         )
-        .route("/guilds/{gid}/modules/calendar/refresh", post(refresh))
-        .route("/guilds/{gid}/modules/calendar/rules", post(create))
-        .route("/guilds/{gid}/modules/calendar/rules/new", get(new_rule))
+        .route("/projects/{pid}/modules/calendar/refresh", post(refresh))
+        .route("/projects/{pid}/modules/calendar/rules", post(create))
+        .route("/projects/{pid}/modules/calendar/rules/new", get(new_rule))
         .route(
-            "/guilds/{gid}/modules/calendar/rules/{rid}",
+            "/projects/{pid}/modules/calendar/rules/{rid}",
             get(edit_rule).post(save_rule),
         )
         .route(
-            "/guilds/{gid}/modules/calendar/rules/{rid}/delete",
+            "/projects/{pid}/modules/calendar/rules/{rid}/delete",
             post(remove_rule),
         )
         .route(
-            "/guilds/{gid}/modules/calendar/rules/{rid}/test",
+            "/projects/{pid}/modules/calendar/rules/{rid}/test",
             post(test_rule),
         )
-        .merge(token_routes(ID))
+        .merge(key_routes(Service::ClickUp, ID))
+        .merge(key_routes(Service::Discord, ID))
 }
 
-fn base_path(gid: u64) -> String {
-    format!("/guilds/{gid}/modules/{ID}")
+fn base_path(pid: i64) -> String {
+    format!("/projects/{pid}/modules/{ID}")
 }
 
-fn rule_path(gid: u64, rid: i64) -> String {
-    format!("{}/rules/{rid}", base_path(gid))
+fn rule_path(pid: i64, rid: i64) -> String {
+    format!("{}/rules/{rid}", base_path(pid))
 }
 
-fn channels(state: &AppState, gid: u64) -> Vec<ChannelOption> {
-    state
-        .discord()
-        .map(|d| info::text_channels(&d.cache, gid))
+async fn discord(state: &AppState, pid: i64) -> anyhow::Result<Option<Conn>> {
+    Ok(connection(state, pid, ID).await?.ok())
+}
+
+fn guild_roles(conn: Option<&Conn>) -> Vec<RoleOption> {
+    conn.map(|c| info::roles(&c.handle.cache, c.guild_id))
         .unwrap_or_default()
 }
 
-fn guild_roles(state: &AppState, gid: u64) -> Vec<RoleOption> {
-    state
-        .discord()
-        .map(|d| info::roles(&d.cache, gid))
-        .unwrap_or_default()
-}
-
-fn guild_emojis(state: &AppState, gid: u64) -> Vec<EmojiOption> {
-    state
-        .discord()
-        .map(|d| reactions::guild_emojis(&d.cache, gid))
-        .unwrap_or_default()
+/// Custom emojis of the server. While the bot cannot be reached, the ones `keep` already
+/// uses stay valid, so saving a rule does not drop its reactions.
+fn guild_emojis(conn: Option<&Conn>, keep: &[Reaction]) -> Vec<EmojiOption> {
+    match conn {
+        Some(c) => reactions::guild_emojis(&c.handle.cache, c.guild_id),
+        None => keep.iter().filter_map(Reaction::as_emoji_option).collect(),
+    }
 }
 
 impl LogRow {
@@ -120,23 +121,23 @@ type Catalog = Vec<(String, Vec<(String, String)>)>;
 
 async fn catalog(
     state: &AppState,
-    gid: u64,
+    pid: i64,
     cred: &Credential,
 ) -> Result<Arc<Catalog>, ClickUpError> {
     // Keyed by the key itself, so a replaced key never shows the old account's lists.
     let fingerprint = &crate::auth::hash_token(cred.token.expose())[..16];
-    let key = format!("calendar:catalog:{gid}:{fingerprint}");
+    let key = format!("calendar:catalog:{pid}:{fingerprint}");
     if let Some(hit) = state.cache.get::<Catalog>(&key, CATALOG_MAX_AGE) {
         return Ok(hit);
     }
     let (db, client, token) = (&state.db, &state.clickup, &cred.token);
 
-    let teams = tokens::track(db, gid, ID, cred, client.teams(token).await).await?;
+    let teams = keys::track(db, pid, ID, cred, client.teams(token).await).await?;
     let many_teams = teams.len() > 1;
     let mut groups: Catalog = Vec::new();
     let mut spaces_seen = 0;
     for team in teams.iter().take(CATALOG_MAX_TEAMS) {
-        let spaces = tokens::track(db, gid, ID, cred, client.spaces(token, &team.id).await).await?;
+        let spaces = keys::track(db, pid, ID, cred, client.spaces(token, &team.id).await).await?;
         for space in spaces {
             if spaces_seen >= CATALOG_MAX_SPACES {
                 break;
@@ -147,9 +148,9 @@ async fn catalog(
             } else {
                 space.name.clone()
             };
-            let loose = tokens::track(
+            let loose = keys::track(
                 db,
-                gid,
+                pid,
                 ID,
                 cred,
                 client.folderless_lists(token, &space.id).await,
@@ -162,7 +163,7 @@ async fn catalog(
                 ));
             }
             let folders =
-                tokens::track(db, gid, ID, cred, client.folders(token, &space.id).await).await?;
+                keys::track(db, pid, ID, cred, client.folders(token, &space.id).await).await?;
             for folder in folders.into_iter().filter(|f| !f.lists.is_empty()) {
                 groups.push((
                     format!("{prefix} / {}", folder.name),
@@ -174,10 +175,10 @@ async fn catalog(
     Ok(state.cache.insert(key, groups))
 }
 
-fn invalidate_catalog(state: &AppState, gid: u64) {
+fn invalidate_catalog(state: &AppState, pid: i64) {
     state
         .cache
-        .remove_prefix(&format!("calendar:catalog:{gid}:"));
+        .remove_prefix(&format!("calendar:catalog:{pid}:"));
 }
 
 // ---------------------------------------------------------------- main page
@@ -231,10 +232,10 @@ impl RuleRow {
 #[template(path = "modules/calendar.html")]
 struct CalendarPage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
     enabled: bool,
     warnings: Vec<String>,
-    token: TokenView,
+    keys: Vec<KeyView>,
     cfg: CalendarConfig,
     catalog: Vec<ListGroup>,
     catalog_error: Option<String>,
@@ -349,14 +350,18 @@ fn role_warning(
 async fn page(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(&state, gid)?;
-    let enabled = modules::is_enabled(&state.db, gid, ID).await?;
-    let cfg = load_config(&state.db, gid).await?;
-    let rules = list_rules(&state.db, gid).await?;
-    let channel_list = channels(&state, gid);
+    let project = require_project(&state, pid).await?;
+    let enabled = modules::is_enabled(&state.db, pid, ID).await?;
+    let cfg = load_config(&state.db, pid).await?;
+    let rules = list_rules(&state.db, pid).await?;
+    let conn = discord(&state, pid).await?;
+    let channel_list = conn
+        .as_ref()
+        .map(|c| info::text_channels(&c.handle.cache, c.guild_id))
+        .unwrap_or_default();
     let tz = cfg.tz();
     let now = now();
 
@@ -367,16 +372,19 @@ async fn page(
     if cfg.list_id.is_none() {
         warnings.push("No ClickUp list is selected yet, so nothing is posted.".into());
     }
-    let roles = guild_roles(&state, gid);
-    let tag_roles = clickup::tag_roles(&state, gid).await?;
-    for rule in rules.iter().filter(|r| r.enabled) {
-        warnings.extend(channel_warning(rule, &channel_list));
-        warnings.extend(role_warning(rule, &channel_list, &roles, &tag_roles));
+    // Channel and role checks need the bot; without it the Discord card says why.
+    if let Some(conn) = &conn {
+        let roles = guild_roles(Some(conn));
+        let tag_roles = clickup::tag_roles(&state, pid, Some(conn)).await?;
+        for rule in rules.iter().filter(|r| r.enabled) {
+            warnings.extend(channel_warning(rule, &channel_list));
+            warnings.extend(role_warning(rule, &channel_list, &roles, &tag_roles));
+        }
     }
     if rules.iter().any(|r| r.enabled && r.mention_assignees)
-        && !state
-            .missing_intents(GatewayIntents::GUILD_MEMBERS)
-            .is_empty()
+        && conn
+            .as_ref()
+            .is_some_and(|c| !c.handle.intents.contains(GatewayIntents::GUILD_MEMBERS))
     {
         warnings.push(
             "Server Members Intent is disabled, so assignees may not be matched to members and \
@@ -387,8 +395,8 @@ async fn page(
 
     let mut catalog_groups = Vec::new();
     let mut catalog_error = None;
-    if let Ok(cred) = tokens::resolve(&state, gid, ID).await? {
-        match catalog(&state, gid, &cred).await {
+    if let Ok(cred) = keys::resolve(&state, pid, Service::ClickUp, ID).await? {
+        match catalog(&state, pid, &cred).await {
             Ok(groups) => {
                 catalog_groups = groups
                     .iter()
@@ -421,7 +429,7 @@ async fn page(
     let mut upcoming_error = None;
     let mut truncated = false;
     if cfg.list_id.is_some() {
-        match events::cached(&state, gid, &cfg, now, UPCOMING_SECS, events::MAX_AGE).await? {
+        match events::cached(&state, pid, &cfg, now, UPCOMING_SECS, events::MAX_AGE).await? {
             Ok(fetched) => {
                 truncated = fetched.truncated;
                 let list: Vec<_> = fetched
@@ -430,8 +438,8 @@ async fn page(
                     .take(UPCOMING_MAX)
                     .collect();
                 let people: Vec<_> = list.iter().flat_map(|e| e.assignees.clone()).collect();
-                let resolver = clickup::resolver(&state, gid, &people).await?;
-                let members = crate::bot::members::guild_members(&state, gid).await;
+                let resolver = clickup::resolver(&state, pid, conn.as_ref(), &people).await?;
+                let members = guild_members(&state, conn.as_ref()).await;
                 let names: HashMap<u64, &str> =
                     members.iter().map(|m| (m.id, m.display())).collect();
                 for e in list {
@@ -486,6 +494,7 @@ async fn page(
             enabled: r.enabled,
             channel: match r.channel_id {
                 None => "Not set".into(),
+                Some(_) if conn.is_none() => "Set".into(),
                 Some(id) => channel_list
                     .iter()
                     .find(|c| c.id == id)
@@ -502,13 +511,16 @@ async fn page(
         })
         .collect();
 
-    let stat = |key| counter(&state.db, Some(gid), ID, key);
+    let stat = |key| counter(&state.db, Some(pid), ID, key);
     let page = CalendarPage {
-        page: PageCtx::new(&user, "guilds", &msg),
-        guild,
+        page: PageCtx::new(&user, "projects", &msg),
+        project,
         enabled,
         warnings,
-        token: token_view(&state, gid, ID).await?,
+        keys: vec![
+            key_view(&state, pid, Service::ClickUp, ID).await?,
+            key_view(&state, pid, Service::Discord, ID).await?,
+        ],
         catalog: catalog_groups,
         catalog_error,
         list_outside_catalog,
@@ -524,7 +536,7 @@ async fn page(
         failed: stat("failed").await?,
         missed: stat("missed").await?,
         api_err: stat("api_err").await?,
-        recent: recent_log(&state.db, gid, 10).await?,
+        recent: recent_log(&state.db, pid, 10).await?,
         cfg,
     };
     Ok(Html(page.render()?))
@@ -564,12 +576,12 @@ fn manual_list_id(raw: &str) -> Option<String> {
 async fn save_source(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(form): Form<SourceForm>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
-    let current = load_config(&state.db, gid).await?;
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
+    let current = load_config(&state.db, pid).await?;
 
     let time_field = match form.time_field.as_str() {
         "due" | "start" => form.time_field.clone(),
@@ -595,12 +607,12 @@ async fn save_source(
     } else if current.list_id.as_deref() == Some(list_input.as_str()) {
         (current.list_id.clone(), current.list_name.clone())
     } else {
-        let cred = match tokens::resolve(&state, gid, ID).await? {
+        let cred = match keys::resolve(&state, pid, Service::ClickUp, ID).await? {
             Ok(c) => c,
             Err(p) => return Ok(redirect_msg(&back, FetchError::Token(p).code())),
         };
         let result = state.clickup.list(&cred.token, &list_input).await;
-        let list = match tokens::track(&state.db, gid, ID, &cred, result).await {
+        let list = match keys::track(&state.db, pid, ID, &cred, result).await {
             Ok(list) => list,
             Err(e) => return Ok(redirect_msg(&back, FetchError::Api(e).code())),
         };
@@ -626,22 +638,24 @@ async fn save_source(
         include_subtasks: form.include_subtasks.is_some(),
         include_closed: form.include_closed.is_some(),
     };
-    save_config(&state.db, gid, &cfg, &user.username).await?;
-    events::invalidate(&state, gid);
-    tracing::info!(user = %user.username, guild_id = gid, list = ?cfg.list_id, "calendar source saved");
+    save_config(&state.db, pid, &cfg, &user.username).await?;
+    events::invalidate(&state, pid);
+    tracing::info!(user = %user.username, project_id = pid, list = ?cfg.list_id, "calendar source saved");
     Ok(redirect_msg(&back, "saved"))
 }
 
 async fn refresh(
     State(state): State<AppState>,
     CurrentUser(_user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    events::invalidate(&state, gid);
-    invalidate_catalog(&state, gid);
-    state.members.invalidate(gid);
-    Ok(redirect_msg(&base_path(gid), "refreshed"))
+    require_project(&state, pid).await?;
+    events::invalidate(&state, pid);
+    invalidate_catalog(&state, pid);
+    if let Some(conn) = discord(&state, pid).await? {
+        state.members.invalidate(conn.guild_id);
+    }
+    Ok(redirect_msg(&base_path(pid), "refreshed"))
 }
 
 // ---------------------------------------------------------------- rule editor
@@ -656,7 +670,7 @@ struct DayBox {
 #[template(path = "modules/calendar_rule.html")]
 struct RulePage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
     rule: Rule,
     is_new: bool,
     is_digest: bool,
@@ -684,41 +698,46 @@ async fn rule_page(
     state: &AppState,
     user: &crate::auth::SessionUser,
     msg: &MsgQuery,
-    gid: u64,
+    pid: i64,
     rule: Rule,
     is_new: bool,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(state, gid)?;
-    let cfg = load_config(&state.db, gid).await?;
-    let mut channel_list = channels(state, gid);
-    for c in &mut channel_list {
-        c.selected = Some(c.id) == rule.channel_id;
-    }
+    let project = require_project(state, pid).await?;
+    let cfg = load_config(&state.db, pid).await?;
+    let conn = discord(state, pid).await?;
+    let channel_list = channel_choices(conn.as_ref(), rule.channel_id);
 
     let mut warnings = Vec::new();
     if cfg.list_id.is_none() {
         warnings.push("No ClickUp list is selected, the preview uses a sample event.".to_owned());
     }
-    if !is_new {
+    if conn.is_none() {
+        warnings.push(
+            "The Discord bot of this module is not available, so channels, roles and custom \
+             emojis cannot be listed. See the Discord card on the Calendar page."
+                .to_owned(),
+        );
+    }
+    if !is_new && conn.is_some() {
         warnings.extend(channel_warning(&rule, &channel_list));
-        let tag_roles = clickup::tag_roles(state, gid).await?;
+        let tag_roles = clickup::tag_roles(state, pid, conn.as_ref()).await?;
         warnings.extend(role_warning(
             &rule,
             &channel_list,
-            &guild_roles(state, gid),
+            &guild_roles(conn.as_ref()),
             &tag_roles,
         ));
     }
-    if is_new && count_rules(&state.db, gid).await? >= MAX_RULES {
+    if is_new && count_rules(&state.db, pid).await? >= MAX_RULES {
         warnings.push(format!(
-            "This server already has {MAX_RULES} rules, the maximum."
+            "This project already has {MAX_RULES} rules, the maximum."
         ));
     }
 
-    let preview = runner::preview(state, gid, &rule, now()).await?;
+    let preview = runner::preview(state, pid, &rule, now()).await?;
     let page = RulePage {
-        page: PageCtx::new(user, "guilds", msg),
-        guild,
+        page: PageCtx::new(user, "projects", msg),
+        project,
         is_new,
         is_digest: rule.kind == Kind::Digest,
         per_event: rule.layout == Layout::PerEvent,
@@ -737,7 +756,7 @@ async fn rule_page(
         reactions: reactions::to_storage(&rule.reactions),
         item_placeholders: ITEM_PLACEHOLDERS,
         header_placeholders: HEADER_PLACEHOLDERS,
-        emojis: guild_emojis(state, gid),
+        emojis: guild_emojis(conn.as_ref(), &rule.reactions),
         quick_reactions: QUICK_REACTIONS,
         preview,
         timezone: match rule.kind {
@@ -762,28 +781,28 @@ struct NewRuleQuery {
 async fn new_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(q): Query<NewRuleQuery>,
 ) -> AppResult<Html<String>> {
-    require_guild(&state, gid)?;
+    require_project(&state, pid).await?;
     let kind = Kind::parse(q.kind.as_deref().unwrap_or("digest")).ok_or(AppError::BadRequest)?;
     let mut rule = Rule::new(kind);
     // The browser's zone replaces this when scripts run, see `data-detect-tz`.
-    rule.timezone = load_config(&state.db, gid).await?.timezone;
-    rule_page(&state, &user, &q.msg, gid, rule, true).await
+    rule.timezone = load_config(&state.db, pid).await?.timezone;
+    rule_page(&state, &user, &q.msg, pid, rule, true).await
 }
 
 async fn edit_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    require_guild(&state, gid)?;
-    let rule = load_rule(&state.db, gid, rid)
+    require_project(&state, pid).await?;
+    let rule = load_rule(&state.db, pid, rid)
         .await?
         .ok_or(AppError::NotFound)?;
-    rule_page(&state, &user, &msg, gid, rule, false).await
+    rule_page(&state, &user, &msg, pid, rule, false).await
 }
 
 fn template_field(raw: Option<&str>) -> Result<String, &'static str> {
@@ -910,97 +929,96 @@ fn parse_rule_form(
 async fn create(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(fields): Form<Vec<(String, String)>>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
+    require_project(&state, pid).await?;
     let kind_raw = fields
         .iter()
         .find(|(k, _)| k == "kind")
         .map(|(_, v)| v.as_str())
         .unwrap_or_default();
     let kind = Kind::parse(kind_raw).ok_or(AppError::BadRequest)?;
-    if count_rules(&state.db, gid).await? >= MAX_RULES {
-        return Ok(redirect_msg(&base_path(gid), "too_many_rules"));
+    if count_rules(&state.db, pid).await? >= MAX_RULES {
+        return Ok(redirect_msg(&base_path(pid), "too_many_rules"));
     }
+    let conn = discord(&state, pid).await?;
     let rule = match parse_rule_form(
         &fields,
         Rule::new(kind),
-        &channels(&state, gid),
-        &guild_emojis(&state, gid),
+        &channel_choices(conn.as_ref(), None),
+        &guild_emojis(conn.as_ref(), &[]),
     ) {
         Ok(r) => r,
         Err(code) => {
             let to = format!(
                 "{}/rules/new?kind={}&msg={code}",
-                base_path(gid),
+                base_path(pid),
                 kind.as_str()
             );
             return Ok(Redirect::to(&to).into_response());
         }
     };
-    let id = insert_rule(&state.db, gid, &rule, &user.username).await?;
-    tracing::info!(user = %user.username, guild_id = gid, rule = id, "calendar rule created");
-    Ok(redirect_msg(&rule_path(gid, id), "rule_created"))
+    let id = insert_rule(&state.db, pid, &rule, &user.username).await?;
+    tracing::info!(user = %user.username, project_id = pid, rule = id, "calendar rule created");
+    Ok(redirect_msg(&rule_path(pid, id), "rule_created"))
 }
 
 async fn save_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
     Form(fields): Form<Vec<(String, String)>>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let current = load_rule(&state.db, gid, rid)
+    require_project(&state, pid).await?;
+    let current = load_rule(&state.db, pid, rid)
         .await?
         .ok_or(AppError::NotFound)?;
-    let back = rule_path(gid, rid);
-    let rule = match parse_rule_form(
-        &fields,
-        current,
-        &channels(&state, gid),
-        &guild_emojis(&state, gid),
-    ) {
+    let back = rule_path(pid, rid);
+    let conn = discord(&state, pid).await?;
+    let channels = channel_choices(conn.as_ref(), current.channel_id);
+    let emojis = guild_emojis(conn.as_ref(), &current.reactions);
+    let rule = match parse_rule_form(&fields, current, &channels, &emojis) {
         Ok(r) => r,
         Err(code) => return Ok(redirect_msg(&back, code)),
     };
-    update_rule(&state.db, gid, &rule, &user.username).await?;
-    tracing::info!(user = %user.username, guild_id = gid, rule = rid, "calendar rule saved");
+    update_rule(&state.db, pid, &rule, &user.username).await?;
+    tracing::info!(user = %user.username, project_id = pid, rule = rid, "calendar rule saved");
     Ok(redirect_msg(&back, "saved"))
 }
 
 async fn remove_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    if !delete_rule(&state.db, gid, rid).await? {
+    require_project(&state, pid).await?;
+    if !delete_rule(&state.db, pid, rid).await? {
         return Err(AppError::NotFound);
     }
-    tracing::info!(user = %user.username, guild_id = gid, rule = rid, "calendar rule deleted");
-    Ok(redirect_msg(&base_path(gid), "rule_deleted"))
+    tracing::info!(user = %user.username, project_id = pid, rule = rid, "calendar rule deleted");
+    Ok(redirect_msg(&base_path(pid), "rule_deleted"))
 }
 
 async fn test_rule(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, rid)): Path<(u64, i64)>,
+    Path((pid, rid)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let rule = load_rule(&state.db, gid, rid)
+    require_project(&state, pid).await?;
+    let rule = load_rule(&state.db, pid, rid)
         .await?
         .ok_or(AppError::NotFound)?;
-    let back = rule_path(gid, rid);
-    let Some(discord) = state.discord() else {
+    let back = rule_path(pid, rid);
+    let Some(conn) = discord(&state, pid).await? else {
         return Ok(redirect_msg(&back, "bot_offline"));
     };
     if rule.channel_id.is_none() {
         return Ok(redirect_msg(&back, "no_channel"));
     }
-    let outbox = DiscordOutbox::new(&discord.http);
-    let outcome = runner::send_test(&state, gid, &rule, &outbox, now()).await?;
-    tracing::info!(user = %user.username, guild_id = gid, rule = rid, ?outcome, "calendar test sent");
+    let outbox = DiscordOutbox::new(&conn.handle.http);
+    let outcome = runner::send_test(&state, pid, &rule, &outbox, now()).await?;
+    tracing::info!(user = %user.username, project_id = pid, rule = rid, ?outcome, "calendar test sent");
     let code = match outcome {
         TestOutcome::Sent => "test_sent",
         TestOutcome::Failed => "test_failed",

@@ -17,7 +17,9 @@ use sqlx::SqlitePool;
 use self::reactions::Reaction;
 use super::{Module, StatItem, counter};
 use crate::db::{now, sf};
-use crate::state::{AppState, DiscordHandle};
+use crate::discord::connection::connection;
+use crate::keys::Service;
+use crate::state::AppState;
 
 pub const ID: &str = "calendar";
 pub const MAX_RULES: i64 = 20;
@@ -52,9 +54,13 @@ impl Module for CalendarModule {
         "Posts agendas and reminders of meetings and events from a ClickUp list."
     }
 
-    async fn summary(&self, state: &AppState, guild_id: u64) -> Result<Vec<StatItem>> {
-        let cfg = load_config(&state.db, guild_id).await?;
-        let active = list_rules(&state.db, guild_id)
+    fn services(&self) -> &'static [Service] {
+        &[Service::ClickUp, Service::Discord]
+    }
+
+    async fn summary(&self, state: &AppState, project_id: i64) -> Result<Vec<StatItem>> {
+        let cfg = load_config(&state.db, project_id).await?;
+        let active = list_rules(&state.db, project_id)
             .await?
             .iter()
             .filter(|r| r.enabled)
@@ -65,7 +71,7 @@ impl Module for CalendarModule {
                 cfg.list_name.unwrap_or_else(|| "Not set".into()),
             ),
             StatItem::new("Active rules", active),
-            StatItem::new("Posts sent", posts_sent(&state.db, Some(guild_id)).await?),
+            StatItem::new("Posts sent", posts_sent(&state.db, Some(project_id)).await?),
         ])
     }
 
@@ -77,23 +83,20 @@ impl Module for CalendarModule {
         true
     }
 
-    async fn on_tick(
-        &self,
-        state: &AppState,
-        discord: &DiscordHandle,
-        guild_id: u64,
-    ) -> Result<()> {
-        let outbox = runner::DiscordOutbox::new(&discord.http);
-        runner::run(state, guild_id, now(), &outbox).await
+    async fn on_tick(&self, state: &AppState, project_id: i64) -> Result<()> {
+        // Nothing is posted, or marked as handled, while the bot is not in its server.
+        let Ok(conn) = connection(state, project_id, ID).await? else {
+            return Ok(());
+        };
+        let outbox = runner::DiscordOutbox::new(&conn.handle.http);
+        runner::run(state, project_id, now(), &outbox).await
     }
 }
 
 /// Digest and reminder messages sent, for one guild or all of them.
-pub async fn posts_sent(db: &SqlitePool, guild_id: Option<u64>) -> Result<i64> {
-    Ok(
-        counter(db, guild_id, ID, "digests").await?
-            + counter(db, guild_id, ID, "reminders").await?,
-    )
+pub async fn posts_sent(db: &SqlitePool, project_id: Option<i64>) -> Result<i64> {
+    Ok(counter(db, project_id, ID, "digests").await?
+        + counter(db, project_id, ID, "reminders").await?)
 }
 
 // ---------------------------------------------------------------- source config
@@ -150,13 +153,13 @@ pub fn parse_tags(raw: &str) -> Option<Vec<String>> {
     (tags.len() <= 5 && tags.iter().all(|t| t.chars().count() <= 50)).then_some(tags)
 }
 
-pub async fn load_config(db: &SqlitePool, guild_id: u64) -> Result<CalendarConfig> {
+pub async fn load_config(db: &SqlitePool, project_id: i64) -> Result<CalendarConfig> {
     let cfg = sqlx::query_as(
         "SELECT list_id, list_name, time_field, timezone, tag_filter, include_subtasks,
                 include_closed
-         FROM calendar_config WHERE guild_id = ?",
+         FROM calendar_config WHERE project_id = ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_optional(db)
     .await?;
     Ok(cfg.unwrap_or_default())
@@ -164,16 +167,16 @@ pub async fn load_config(db: &SqlitePool, guild_id: u64) -> Result<CalendarConfi
 
 pub async fn save_config(
     db: &SqlitePool,
-    guild_id: u64,
+    project_id: i64,
     cfg: &CalendarConfig,
     by: &str,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO calendar_config
-             (guild_id, list_id, list_name, time_field, timezone, tag_filter, include_subtasks,
+             (project_id, list_id, list_name, time_field, timezone, tag_filter, include_subtasks,
               include_closed, updated_at, updated_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (guild_id) DO UPDATE SET
+         ON CONFLICT (project_id) DO UPDATE SET
              list_id = excluded.list_id,
              list_name = excluded.list_name,
              time_field = excluded.time_field,
@@ -184,7 +187,7 @@ pub async fn save_config(
              updated_at = excluded.updated_at,
              updated_by = excluded.updated_by",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(cfg.list_id.clone())
     .bind(cfg.list_name.clone())
     .bind(cfg.time_field.clone())
@@ -422,33 +425,33 @@ const RULE_COLUMNS: &str = "id, name, enabled, kind, channel_id, days, time_of_d
     item_template, empty_template, mention_assignees, mention_roles, use_embed, embed_color, \
     description_max, reactions, last_run_at";
 
-pub async fn list_rules(db: &SqlitePool, guild_id: u64) -> Result<Vec<Rule>> {
+pub async fn list_rules(db: &SqlitePool, project_id: i64) -> Result<Vec<Rule>> {
     let rows: Vec<RuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {RULE_COLUMNS} FROM calendar_rules WHERE guild_id = ?
+        "SELECT {RULE_COLUMNS} FROM calendar_rules WHERE project_id = ?
          ORDER BY kind, name COLLATE NOCASE, id"
     )))
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_all(db)
     .await?;
     Ok(rows.into_iter().map(Rule::from).collect())
 }
 
 /// A rule of this guild. Ids of other guilds' rules return None.
-pub async fn load_rule(db: &SqlitePool, guild_id: u64, rule_id: i64) -> Result<Option<Rule>> {
+pub async fn load_rule(db: &SqlitePool, project_id: i64, rule_id: i64) -> Result<Option<Rule>> {
     let row: Option<RuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {RULE_COLUMNS} FROM calendar_rules WHERE guild_id = ? AND id = ?"
+        "SELECT {RULE_COLUMNS} FROM calendar_rules WHERE project_id = ? AND id = ?"
     )))
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(rule_id)
     .fetch_optional(db)
     .await?;
     Ok(row.map(Rule::from))
 }
 
-pub async fn count_rules(db: &SqlitePool, guild_id: u64) -> Result<i64> {
+pub async fn count_rules(db: &SqlitePool, project_id: i64) -> Result<i64> {
     Ok(
-        sqlx::query_scalar("SELECT COUNT(*) FROM calendar_rules WHERE guild_id = ?")
-            .bind(sf(guild_id))
+        sqlx::query_scalar("SELECT COUNT(*) FROM calendar_rules WHERE project_id = ?")
+            .bind(project_id)
             .fetch_one(db)
             .await?,
     )
@@ -456,17 +459,17 @@ pub async fn count_rules(db: &SqlitePool, guild_id: u64) -> Result<i64> {
 
 /// Inserts a rule and returns its id. `last_run_at` starts at `now`, so a digest time
 /// earlier today does not fire right after saving.
-pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) -> Result<i64> {
+pub async fn insert_rule(db: &SqlitePool, project_id: i64, rule: &Rule, by: &str) -> Result<i64> {
     let res = sqlx::query(
         "INSERT INTO calendar_rules
-             (guild_id, name, enabled, kind, channel_id, days, time_of_day, timezone,
+             (project_id, name, enabled, kind, channel_id, days, time_of_day, timezone,
               lookahead_hours, offset_minutes, lead_minutes, layout, max_events,
               post_when_empty, header_template, item_template, empty_template,
               mention_assignees, mention_roles, use_embed, embed_color, description_max,
               reactions, last_run_at, created_at, updated_at, updated_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(rule.name.clone())
     .bind(rule.enabled)
     .bind(rule.kind.as_str())
@@ -500,7 +503,7 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
 
 /// Saves every editable field of `rule` (matched by id and guild). Resets `last_run_at` to
 /// now, like [`insert_rule`].
-pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) -> Result<()> {
+pub async fn update_rule(db: &SqlitePool, project_id: i64, rule: &Rule, by: &str) -> Result<()> {
     sqlx::query(
         "UPDATE calendar_rules SET
              name = ?, enabled = ?, channel_id = ?, days = ?, time_of_day = ?, timezone = ?,
@@ -510,7 +513,7 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
              mention_assignees = ?, mention_roles = ?, use_embed = ?, embed_color = ?,
              description_max = ?, reactions = ?, last_run_at = ?, updated_at = ?,
              updated_by = ?
-         WHERE guild_id = ? AND id = ?",
+         WHERE project_id = ? AND id = ?",
     )
     .bind(rule.name.clone())
     .bind(rule.enabled)
@@ -536,7 +539,7 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(now())
     .bind(now())
     .bind(by.to_owned())
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(rule.id)
     .execute(db)
     .await?;
@@ -550,9 +553,9 @@ fn layout_str(layout: Layout) -> &'static str {
     }
 }
 
-pub async fn delete_rule(db: &SqlitePool, guild_id: u64, rule_id: i64) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM calendar_rules WHERE guild_id = ? AND id = ?")
-        .bind(sf(guild_id))
+pub async fn delete_rule(db: &SqlitePool, project_id: i64, rule_id: i64) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM calendar_rules WHERE project_id = ? AND id = ?")
+        .bind(project_id)
         .bind(rule_id)
         .execute(db)
         .await?;
@@ -606,17 +609,17 @@ pub struct LogEntry<'a> {
     pub is_test: bool,
 }
 
-pub async fn log(db: &SqlitePool, guild_id: u64, entry: LogEntry<'_>) -> Result<()> {
+pub async fn log(db: &SqlitePool, project_id: i64, entry: LogEntry<'_>) -> Result<()> {
     let error = entry.error.map(|mut e| {
         e.truncate(e.floor_char_boundary(300));
         e
     });
     sqlx::query(
         "INSERT INTO calendar_log
-             (guild_id, rule_id, rule_name, kind, events, success, error, is_test, created_at)
+             (project_id, rule_id, rule_name, kind, events, success, error, is_test, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(entry.rule.id)
     .bind(entry.rule.name.clone())
     .bind(entry.kind.to_owned())
@@ -641,12 +644,12 @@ pub struct LogRow {
     pub created_at: i64,
 }
 
-pub async fn recent_log(db: &SqlitePool, guild_id: u64, limit: i64) -> Result<Vec<LogRow>> {
+pub async fn recent_log(db: &SqlitePool, project_id: i64, limit: i64) -> Result<Vec<LogRow>> {
     Ok(sqlx::query_as(
         "SELECT rule_name, kind, events, success, error, is_test, created_at FROM calendar_log
-         WHERE guild_id = ? ORDER BY id DESC LIMIT ?",
+         WHERE project_id = ? ORDER BY id DESC LIMIT ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(limit)
     .fetch_all(db)
     .await?)

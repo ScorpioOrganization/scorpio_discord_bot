@@ -1,18 +1,18 @@
 {% extends "base.html" %}
-{% block title %}ClickUp | {{ guild.name }}{% endblock %}
+{% block title %}ClickUp | {{ project.name }}{% endblock %}
 {% block content %}
 <nav class="crumbs">
   <a href="/">Overview</a><span>/</span>
-  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span>
   <span>ClickUp</span>
 </nav>
 
 <header class="page-head">
   <div>
     <h1>ClickUp</h1>
-    <p class="muted">The API key other modules can share, and who is who between ClickUp and this server.</p>
+    <p class="muted">The API key other modules can share, and who is who between ClickUp and Discord.</p>
   </div>
-  <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/toggle" class="toggle-form">
+  <form method="post" action="/projects/{{ project.id }}/modules/clickup/toggle" class="toggle-form">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">
     <input type="hidden" name="back" value="module">
     {% if enabled %}
@@ -33,9 +33,9 @@
 
 <div class="two-col">
   <div class="stack">
-    {% include "clickup/token_card.html" %}
+    {% include "keys/cards.html" %}
     {% if has_key %}
-    <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/test" class="actions">
+    <form method="post" action="/projects/{{ project.id }}/modules/clickup/test" class="actions">
       <input type="hidden" name="_csrf" value="{{ page.csrf }}">
       <button class="btn btn-secondary" type="submit">Test connection</button>
     </form>
@@ -50,7 +50,7 @@
       {% else if let Some(err) = team_error %}
       <div class="callout callout-err small">Could not load workspaces: {{ err }}</div>
       {% else %}
-      <form class="form" method="post" action="/guilds/{{ guild.id }}/modules/clickup/workspace">
+      <form class="form" method="post" action="/projects/{{ project.id }}/modules/clickup/workspace">
         <input type="hidden" name="_csrf" value="{{ page.csrf }}">
         <label>
           <span>Workspace whose people are listed below</span>
@@ -76,7 +76,7 @@
 <section class="card">
   <div class="label-row">
     <h2>People</h2>
-    <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/members/refresh">
+    <form method="post" action="/projects/{{ project.id }}/modules/clickup/members/refresh">
       <input type="hidden" name="_csrf" value="{{ page.csrf }}">
       <button class="btn btn-ghost btn-sm" type="submit">Reload server members ({{ member_count }})</button>
     </form>
@@ -85,7 +85,7 @@
   {% if people.is_empty() %}
   <p class="muted">{% if workspace.is_some() %}This workspace has no people.{% else %}Select a workspace to list its people.{% endif %}</p>
   {% else %}
-  <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/mapping">
+  <form method="post" action="/projects/{{ project.id }}/modules/clickup/mapping">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">
     <div class="table-wrap">
       <table class="table mapping-table">
@@ -120,10 +120,12 @@
   {% if let Some(err) = tag_error %}
   <div class="callout callout-err small">Could not load the workspace's tags: {{ err }}</div>
   {% endif %}
-  {% if roles.is_empty() %}
-  <p class="muted">This server has no roles to map yet.</p>
+  {% if !discord_ready %}
+  <p class="muted">The shared Discord bot is not available, so roles cannot be listed. Saved tag roles keep working once it is back.</p>
+  {% else if roles.is_empty() %}
+  <p class="muted">The Discord server has no roles to map yet.</p>
   {% else %}
-  <form method="post" action="/guilds/{{ guild.id }}/modules/clickup/tag-roles">
+  <form method="post" action="/projects/{{ project.id }}/modules/clickup/tag-roles">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">
     <div class="table-wrap">
       <table class="table mapping-table">

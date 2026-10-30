@@ -13,9 +13,9 @@ use super::events::Event;
 use super::reactions::Reaction;
 use super::schedule::fmt_local_as;
 use super::{Layout, Rule};
-use crate::bot::info::RoleOption;
-use crate::bot::members::MemberInfo;
 use crate::clickup::mapping::Resolver;
+use crate::discord::info::RoleOption;
+use crate::discord::members::MemberInfo;
 use crate::modules::text::{self, escape_markdown, truncate_chars};
 use crate::web::fmt_duration;
 

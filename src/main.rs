@@ -1,24 +1,29 @@
 mod auth;
-mod bot;
 mod cache;
 mod clickup;
 mod config;
 mod db;
+mod discord;
 mod error;
+mod keys;
 mod modules;
+mod projects;
+mod scheduler;
 mod secrets;
 mod state;
 #[cfg(test)]
 mod test_util;
+mod upgrade;
 mod web;
 
 use std::time::Duration;
 
 use anyhow::Result;
+use sqlx::SqlitePool;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::state::{AppState, DiscordHandle};
+use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,52 +58,25 @@ async fn main() -> Result<()> {
         tracing::warn!("COOKIE_SECURE is off. Turn it on when the dashboard is served over HTTPS.");
     }
 
-    let vault = secrets::Vault::load(&config)?;
-    let state = AppState::new(db, config.clone(), modules::registry(), vault);
+    let state = prepare(config, db).await?;
     tokio::spawn(maintenance(state.clone()));
-
-    let bot_task = match config.discord_token.as_deref() {
-        Some(token) => match bot::build_client(token, state.clone()).await {
-            Ok((mut client, intents)) => {
-                let _ = state.discord.set(DiscordHandle {
-                    http: client.http.clone(),
-                    cache: client.cache.clone(),
-                    shard_manager: client.shard_manager.clone(),
-                    intents,
-                });
-                tokio::spawn(bot::scheduler::run(state.clone()));
-                let task_state = state.clone();
-                Some(tokio::spawn(async move {
-                    if let Err(e) = client.start().await {
-                        let reason = bot::describe_stop(&e);
-                        tracing::error!("{reason}");
-                        task_state.set_bot_error(reason);
-                    }
-                }))
-            }
-            Err(e) => {
-                // Keep the dashboard up so the problem is visible there instead of a restart loop.
-                tracing::error!("Discord bot not started: {e:#}");
-                state.set_bot_error(format!("{e:#}"));
-                None
-            }
-        },
-        None => {
-            tracing::warn!("DISCORD_TOKEN is not set, running the dashboard only");
-            None
-        }
-    };
+    tokio::spawn(discord::hub::DiscordHub::run(state.clone()));
+    tokio::spawn(scheduler::run(state.clone()));
 
     web::serve(state.clone(), shutdown_signal()).await?;
 
-    // Shards of a client that already stopped cannot be told to shut down.
-    if let (Some(discord), Some(task)) = (state.discord(), &bot_task)
-        && !task.is_finished()
-    {
-        discord.shard_manager.shutdown_all().await;
-    }
+    state.discord.shutdown_all().await;
     tracing::info!("bye");
     Ok(())
+}
+
+/// Everything between opening the database and serving: the vault, the state and the data
+/// upgrades that follow migrations.
+async fn prepare(config: Config, db: SqlitePool) -> Result<AppState> {
+    let vault = secrets::Vault::load(&config)?;
+    let state = AppState::new(db, config, modules::registry(), vault);
+    upgrade::run(&state).await;
+    Ok(state)
 }
 
 /// Hourly cleanup of expired sessions, old log rows and stale rate limit entries.

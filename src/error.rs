@@ -42,7 +42,7 @@ impl IntoResponse for AppError {
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
                 "Not found",
-                "This page does not exist, or the bot is not a member of that server.",
+                "This page does not exist, or it was deleted.",
             ),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,

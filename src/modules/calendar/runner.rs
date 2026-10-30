@@ -1,4 +1,4 @@
-//! Posting due digests and reminders, called once a minute per guild by the scheduler.
+//! Posting due digests and reminders, called once a minute per project by the scheduler.
 
 use std::collections::HashSet;
 
@@ -14,10 +14,11 @@ use super::schedule::{self, Digest, GRACE_SECS};
 use super::{
     ID, Kind, LogEntry, Rule, list_rules, load_config, log, mark_sent, set_last_run, was_sent,
 };
-use crate::bot::info;
-use crate::bot::members::guild_members;
 use crate::clickup::client::User;
 use crate::clickup::mapping::Resolver;
+use crate::discord::connection::{Conn, connection};
+use crate::discord::info;
+use crate::discord::members::guild_members;
 use crate::modules::{bump_counter, clickup};
 use crate::state::AppState;
 
@@ -121,7 +122,7 @@ async fn post_all(outbox: &dyn Outbox, channel_id: u64, msgs: &[OutMessage]) -> 
 
 async fn record(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     rule: &Rule,
     events: usize,
     out: Outcome,
@@ -135,7 +136,7 @@ async fn record(
         error: out.error,
         is_test,
     };
-    log(&state.db, guild_id, entry).await?;
+    log(&state.db, project_id, entry).await?;
     if is_test {
         return Ok(());
     }
@@ -145,16 +146,22 @@ async fn record(
         Kind::Reminder => ("reminders", out.posted),
     };
     for _ in 0..sent {
-        bump_counter(&state.db, guild_id, ID, key).await?;
+        bump_counter(&state.db, project_id, ID, key).await?;
     }
     for _ in 0..out.failed {
-        bump_counter(&state.db, guild_id, ID, "failed").await?;
+        bump_counter(&state.db, project_id, ID, "failed").await?;
     }
     Ok(())
 }
 
-/// Matches the assignees of `events` to members (explicit mappings first).
-async fn resolver_for(state: &AppState, guild_id: u64, events: &[Event]) -> Result<Resolver> {
+/// Matches the assignees of `events` to members of the server of `conn` (explicit mappings
+/// first).
+async fn resolver_for(
+    state: &AppState,
+    project_id: i64,
+    conn: Option<&Conn>,
+    events: &[Event],
+) -> Result<Resolver> {
     let mut seen = HashSet::new();
     let people: Vec<User> = events
         .iter()
@@ -162,7 +169,7 @@ async fn resolver_for(state: &AppState, guild_id: u64, events: &[Event]) -> Resu
         .filter(|p| seen.insert(p.id))
         .cloned()
         .collect();
-    clickup::resolver(state, guild_id, &people).await
+    clickup::resolver(state, project_id, conn, &people).await
 }
 
 /// The events of a digest window, `from <= at < to`.
@@ -175,12 +182,12 @@ fn in_window(events: &[Event], from: i64, to: i64) -> Vec<Event> {
 }
 
 /// Posts every digest and reminder that is due at `now`.
-pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox) -> Result<()> {
-    let cfg = load_config(&state.db, guild_id).await?;
+pub async fn run(state: &AppState, project_id: i64, now: i64, outbox: &dyn Outbox) -> Result<()> {
+    let cfg = load_config(&state.db, project_id).await?;
     if cfg.list_id.is_none() {
         return Ok(());
     }
-    let rules: Vec<Rule> = list_rules(&state.db, guild_id)
+    let rules: Vec<Rule> = list_rules(&state.db, project_id)
         .await?
         .into_iter()
         .filter(|r| r.enabled && r.channel_id.is_some())
@@ -209,8 +216,8 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
                     error: Some(error),
                     is_test: false,
                 };
-                log(&state.db, guild_id, entry).await?;
-                bump_counter(&state.db, guild_id, ID, "missed").await?;
+                log(&state.db, project_id, entry).await?;
+                bump_counter(&state.db, project_id, ID, "missed").await?;
             }
             Digest::Wait => {}
         }
@@ -225,18 +232,24 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
         .map(Rule::horizon_secs)
         .max()
         .unwrap_or_default();
-    let fetched = match events::cached(state, guild_id, &cfg, now, horizon, events::FRESH).await? {
+    let fetched = match events::cached(state, project_id, &cfg, now, horizon, events::FRESH).await?
+    {
         Ok(f) => f,
         Err(e) => {
             // Digests stay pending and are retried next minute until the grace runs out.
-            // API errors are already logged and shown on the key card by `tokens::track`.
-            tracing::debug!(guild_id, "calendar could not read ClickUp: {}", e.message());
+            // API errors are already logged and shown on the key card by `keys::track`.
+            tracing::debug!(
+                project_id,
+                "calendar could not read ClickUp: {}",
+                e.message()
+            );
             return Ok(());
         }
     };
     let upcoming = fetched.between(now, i64::MAX);
-    let resolver = resolver_for(state, guild_id, &upcoming).await?;
-    let tag_roles = clickup::tag_roles(state, guild_id).await?;
+    let conn = connection(state, project_id, ID).await?.ok();
+    let resolver = resolver_for(state, project_id, conn.as_ref(), &upcoming).await?;
+    let tag_roles = clickup::tag_roles(state, project_id, conn.as_ref()).await?;
     let list_name = cfg.list_name.clone().unwrap_or_default();
     let ctx = Ctx {
         resolver: &resolver,
@@ -255,14 +268,14 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
         // every minute. The failure is in the log.
         set_last_run(&state.db, rule.id, occurrence).await?;
         tracing::info!(
-            guild_id,
+            project_id,
             rule = %rule.name,
             events = window.len(),
             posted = out.posted,
             failed = out.failed,
             "calendar digest"
         );
-        record(state, guild_id, rule, window.len(), out, false).await?;
+        record(state, project_id, rule, window.len(), out, false).await?;
     }
 
     for rule in reminders {
@@ -283,13 +296,13 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
             let out = post_all(outbox, channel, std::slice::from_ref(&msg)).await;
             mark_sent(&state.db, rule.id, &ev.task_id, ev.at).await?;
             tracing::info!(
-                guild_id,
+                project_id,
                 rule = %rule.name,
                 task = %ev.task_id,
                 ok = out.failed == 0,
                 "calendar reminder"
             );
-            record(state, guild_id, rule, 1, out, false).await?;
+            record(state, project_id, rule, 1, out, false).await?;
             handled += 1;
         }
     }
@@ -302,11 +315,11 @@ pub async fn run(state: &AppState, guild_id: u64, now: i64, outbox: &dyn Outbox)
 /// messages.
 pub async fn sample_messages(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     rule: &Rule,
     now: i64,
 ) -> Result<(Vec<OutMessage>, Option<FetchError>)> {
-    let cfg = load_config(&state.db, guild_id).await?;
+    let cfg = load_config(&state.db, project_id).await?;
     let (from, to) = match rule.kind {
         Kind::Digest => rule.digest_window(
             schedule::next_occurrence(now, rule.days, rule.time_of_day, &rule.tz()).unwrap_or(now),
@@ -319,12 +332,13 @@ pub async fn sample_messages(
         Kind::Reminder => now + 3600,
     });
     let (upcoming, error) =
-        match events::cached(state, guild_id, &cfg, now, to - now, events::MAX_AGE).await? {
+        match events::cached(state, project_id, &cfg, now, to - now, events::MAX_AGE).await? {
             Ok(f) => (f.between(now, i64::MAX), None),
             Err(e) => (vec![sample.clone()], Some(e)),
         };
-    let resolver = resolver_for(state, guild_id, &upcoming).await?;
-    let tag_roles = clickup::tag_roles(state, guild_id).await?;
+    let conn = connection(state, project_id, ID).await?.ok();
+    let resolver = resolver_for(state, project_id, conn.as_ref(), &upcoming).await?;
+    let tag_roles = clickup::tag_roles(state, project_id, conn.as_ref()).await?;
     let list_name = cfg.list_name.clone().unwrap_or_else(|| "Calendar".into());
     let ctx = Ctx {
         resolver: &resolver,
@@ -364,8 +378,8 @@ fn message_text(msg: &OutMessage) -> String {
 
 /// Readable text of the first messages of a rule's next post, for the dashboard. Digest
 /// times are shown in the rule's time zone, reminder times in the server default.
-pub async fn preview(state: &AppState, guild_id: u64, rule: &Rule, now: i64) -> Result<String> {
-    let (msgs, _) = sample_messages(state, guild_id, rule, now).await?;
+pub async fn preview(state: &AppState, project_id: i64, rule: &Rule, now: i64) -> Result<String> {
+    let (msgs, _) = sample_messages(state, project_id, rule, now).await?;
     if msgs.is_empty() {
         return Ok(String::new());
     }
@@ -377,12 +391,13 @@ pub async fn preview(state: &AppState, guild_id: u64, rule: &Rule, now: i64) -> 
         .join("\n\n--- next message ---\n\n");
     let tz = match rule.kind {
         Kind::Digest => rule.tz(),
-        Kind::Reminder => load_config(&state.db, guild_id).await?.tz(),
+        Kind::Reminder => load_config(&state.db, project_id).await?.tz(),
     };
-    let members = guild_members(state, guild_id).await;
-    let roles = state
-        .discord()
-        .map(|d| info::roles(&d.cache, guild_id))
+    let conn = connection(state, project_id, ID).await?.ok();
+    let members = guild_members(state, conn.as_ref()).await;
+    let roles = conn
+        .as_ref()
+        .map(|c| info::roles(&c.handle.cache, c.guild_id))
         .unwrap_or_default();
     let more = if msgs.len() > shown {
         format!("\n\n(and {} more messages)", msgs.len() - shown)
@@ -403,12 +418,12 @@ pub enum TestOutcome {
 /// counting it or changing any schedule state.
 pub async fn send_test(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     rule: &Rule,
     outbox: &dyn Outbox,
     now: i64,
 ) -> Result<TestOutcome> {
-    let (mut msgs, error) = sample_messages(state, guild_id, rule, now).await?;
+    let (mut msgs, error) = sample_messages(state, project_id, rule, now).await?;
     if let Some(e) = error {
         return Ok(TestOutcome::Fetch(e));
     }
@@ -419,7 +434,7 @@ pub async fn send_test(
     }
     let out = post_all(outbox, rule.channel_id.unwrap_or_default(), &msgs).await;
     let ok = out.failed == 0;
-    record(state, guild_id, rule, msgs.len(), out, true).await?;
+    record(state, project_id, rule, msgs.len(), out, true).await?;
     Ok(if ok {
         TestOutcome::Sent
     } else {
@@ -435,14 +450,14 @@ pub mod tests {
 
     use super::*;
     use crate::clickup::mock::{self, MockClickUp};
-    use crate::clickup::tokens;
+    use crate::keys::{self, Service};
     use crate::modules::calendar::{
         CalendarConfig, Layout, insert_rule, load_rule, reactions, recent_log, save_config,
     };
     use crate::modules::clickup::set_tag_role;
     use crate::modules::{counter, set_enabled};
     use crate::secrets::SecretString;
-    use crate::test_util::{self, CHANNEL_ID, GUILD_ID, MEMBER_ID, ROLE_ID};
+    use crate::test_util::{self, CHANNEL_ID, MEMBER_ID, PID, ROLE_ID};
 
     /// Remembers posts instead of sending them. Fails every post while `fail` is set.
     #[derive(Default)]
@@ -477,22 +492,21 @@ pub mod tests {
         outbox: RecordingOutbox,
     }
 
-    /// Connected fake guild, shared ClickUp key, list selected, UTC.
+    /// Connected fake Discord server, shared ClickUp key, list selected, UTC.
     async fn setup() -> Setup {
         let mut state = test_util::state().await;
         let mock = MockClickUp::start().await;
         state.clickup = mock.client();
-        test_util::connect_fake_discord(&state);
+        test_util::connect_fake_discord(&state, PID).await;
         let db = &state.db;
-        set_enabled(db, GUILD_ID, tokens::SHARED, true)
-            .await
-            .unwrap();
+        set_enabled(db, PID, "clickup", true).await.unwrap();
         let key = SecretString::new(mock::TOKEN);
-        tokens::store(
+        keys::store(
             db,
             &state.vault,
-            GUILD_ID,
-            tokens::SHARED,
+            PID,
+            Service::ClickUp,
+            "clickup",
             &key,
             "Owner",
             "root",
@@ -504,7 +518,7 @@ pub mod tests {
             list_name: Some("Events / Team / Calendar".into()),
             ..Default::default()
         };
-        save_config(db, GUILD_ID, &cfg, "root").await.unwrap();
+        save_config(db, PID, &cfg, "root").await.unwrap();
         Setup {
             state,
             mock,
@@ -519,9 +533,7 @@ pub mod tests {
     }
 
     async fn add_rule(s: &Setup, rule: &Rule) -> Rule {
-        let id = insert_rule(&s.state.db, GUILD_ID, rule, "root")
-            .await
-            .unwrap();
+        let id = insert_rule(&s.state.db, PID, rule, "root").await.unwrap();
         // Rules are created "now"; move the start back so the test clock decides.
         sqlx::query("UPDATE calendar_rules SET last_run_at = ? WHERE id = ?")
             .bind(rule.last_run_at)
@@ -529,7 +541,7 @@ pub mod tests {
             .execute(&s.state.db)
             .await
             .unwrap();
-        load_rule(&s.state.db, GUILD_ID, id).await.unwrap().unwrap()
+        load_rule(&s.state.db, PID, id).await.unwrap().unwrap()
     }
 
     fn digest() -> Rule {
@@ -551,7 +563,7 @@ pub mod tests {
     }
 
     async fn count(s: &Setup, key: &str) -> i64 {
-        counter(&s.state.db, Some(GUILD_ID), ID, key).await.unwrap()
+        counter(&s.state.db, Some(PID), ID, key).await.unwrap()
     }
 
     #[tokio::test]
@@ -568,10 +580,10 @@ pub mod tests {
         );
         add_rule(&s, &digest()).await;
 
-        run(&s.state, GUILD_ID, NINE - 60, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE - 60, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "before 09:00");
 
-        run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 30, &s.outbox).await.unwrap();
         let posts = s.outbox.take();
         assert_eq!(posts.len(), 1);
         let (channel, msg) = &posts[0];
@@ -594,14 +606,12 @@ pub mod tests {
         assert!(msg.mention_users.is_empty(), "but not pinged");
         assert_eq!(msg.reactions.len(), 2);
 
-        run(&s.state, GUILD_ID, NINE + 90, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 90, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "same occurrence");
         assert_eq!(count(&s, "digests").await, 1);
 
         // Next day at 09:00 it posts again.
-        run(&s.state, GUILD_ID, NINE + 86400, &s.outbox)
-            .await
-            .unwrap();
+        run(&s.state, PID, NINE + 86400, &s.outbox).await.unwrap();
         let posts = s.outbox.take();
         assert_eq!(posts.len(), 1);
         assert!(posts[0].1.content.contains("Tomorrow"));
@@ -618,15 +628,15 @@ pub mod tests {
         rule.timezone = "Europe/Warsaw".into();
         add_rule(&s, &rule).await;
 
-        run(&s.state, GUILD_ID, NINE - 7200 - 60, &s.outbox)
+        run(&s.state, PID, NINE - 7200 - 60, &s.outbox)
             .await
             .unwrap();
         assert!(s.outbox.take().is_empty(), "before 09:00 Warsaw");
-        run(&s.state, GUILD_ID, NINE - 7200 + 30, &s.outbox)
+        run(&s.state, PID, NINE - 7200 + 30, &s.outbox)
             .await
             .unwrap();
         assert_eq!(s.outbox.take().len(), 1);
-        run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 30, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "09:00 UTC is not the schedule");
     }
 
@@ -652,14 +662,14 @@ pub mod tests {
         let rule = add_rule(&s, &rule).await;
 
         // The preview at 14:00 already shows the window of the 20:00 post.
-        let text = preview(&s.state, GUILD_ID, &rule, NINE + 5 * 3600)
+        let text = preview(&s.state, PID, &rule, NINE + 5 * 3600)
             .await
             .unwrap();
         assert!(text.starts_with("**2026-10-16** (2)"), "{text}");
         assert!(text.contains("Midnight") && text.contains("Afternoon"));
         assert!(!text.contains("Tonight") && !text.contains("Saturday"));
 
-        run(&s.state, GUILD_ID, NINE + 11 * 3600 + 30, &s.outbox)
+        run(&s.state, PID, NINE + 11 * 3600 + 30, &s.outbox)
             .await
             .unwrap();
         let posts = s.outbox.take();
@@ -681,7 +691,7 @@ pub mod tests {
         let mut task = task_at("a", "Standup", NINE + 600);
         task["tags"] = json!([{"name": "Meeting"}, {"name": "unmapped"}]);
         s.mock.set_tasks(mock::LIST_ID, vec![task]);
-        set_tag_role(&s.state.db, GUILD_ID, "meeting", Some(ROLE_ID), "root")
+        set_tag_role(&s.state.db, PID, "meeting", Some(ROLE_ID), "root")
             .await
             .unwrap();
         let mut rule = reminder();
@@ -689,7 +699,7 @@ pub mod tests {
         rule.mention_roles = true;
         let rule = add_rule(&s, &rule).await;
 
-        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE, &s.outbox).await.unwrap();
         let posts = s.outbox.take();
         assert_eq!(posts.len(), 1);
         let msg = &posts[0].1;
@@ -698,13 +708,13 @@ pub mod tests {
         assert!(msg.mention_users.is_empty());
 
         // Test messages never ping, the preview shows role names.
-        send_test(&s.state, GUILD_ID, &rule, &s.outbox, NINE)
+        send_test(&s.state, PID, &rule, &s.outbox, NINE)
             .await
             .unwrap();
         let posts = s.outbox.take();
         assert!(posts[0].1.mention_roles.is_empty());
         assert!(posts[0].1.content.contains(&format!("<@&{ROLE_ID}>")));
-        let text = preview(&s.state, GUILD_ID, &rule, NINE).await.unwrap();
+        let text = preview(&s.state, PID, &rule, NINE).await.unwrap();
         assert_eq!(text, "Standup @Team");
     }
 
@@ -715,17 +725,14 @@ pub mod tests {
         rule.last_run_at = Some(NINE - 86400);
         let rule = add_rule(&s, &rule).await;
 
-        run(&s.state, GUILD_ID, NINE + GRACE_SECS + 60, &s.outbox)
+        run(&s.state, PID, NINE + GRACE_SECS + 60, &s.outbox)
             .await
             .unwrap();
         assert!(s.outbox.take().is_empty());
         assert_eq!(count(&s, "missed").await, 1);
-        let rule = load_rule(&s.state.db, GUILD_ID, rule.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let rule = load_rule(&s.state.db, PID, rule.id).await.unwrap().unwrap();
         assert_eq!(rule.last_run_at, Some(NINE));
-        let log = recent_log(&s.state.db, GUILD_ID, 5).await.unwrap();
+        let log = recent_log(&s.state.db, PID, 5).await.unwrap();
         assert_eq!(log[0].kind, "missed");
         assert!(!log[0].success);
         // No ClickUp call was needed for that.
@@ -753,7 +760,7 @@ pub mod tests {
         empty.post_when_empty = true;
         add_rule(&s, &empty).await;
 
-        run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 30, &s.outbox).await.unwrap();
         let posts = s.outbox.take();
         assert_eq!(posts.len(), 3, "the header, then one message per event");
         let header = &posts[0].1;
@@ -768,7 +775,7 @@ pub mod tests {
         assert!(posts[1..].iter().all(|(_, m)| m.reactions.len() == 2));
 
         // 23:00, nothing within the next hour: the empty message is posted.
-        run(&s.state, GUILD_ID, NINE + 14 * 3600, &s.outbox)
+        run(&s.state, PID, NINE + 14 * 3600, &s.outbox)
             .await
             .unwrap();
         let posts = s.outbox.take();
@@ -784,35 +791,25 @@ pub mod tests {
         add_rule(&s, &reminder()).await;
 
         // 20 minutes before: too early. 15 minutes before: due.
-        run(&s.state, GUILD_ID, NINE + 600, &s.outbox)
-            .await
-            .unwrap();
+        run(&s.state, PID, NINE + 600, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty());
-        run(&s.state, GUILD_ID, NINE + 900, &s.outbox)
-            .await
-            .unwrap();
+        run(&s.state, PID, NINE + 900, &s.outbox).await.unwrap();
         let posts = s.outbox.take();
         assert_eq!(posts.len(), 1);
         assert!(posts[0].1.content.starts_with("Standup"));
-        run(&s.state, GUILD_ID, NINE + 960, &s.outbox)
-            .await
-            .unwrap();
+        run(&s.state, PID, NINE + 960, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "only once");
         assert_eq!(count(&s, "reminders").await, 1);
 
         // The meeting moves to 10:00: a new reminder before the new time.
         s.mock
             .set_tasks(mock::LIST_ID, vec![task_at("a", "Standup", NINE + 3600)]);
-        crate::modules::calendar::events::invalidate(&s.state, GUILD_ID);
-        run(&s.state, GUILD_ID, NINE + 2700, &s.outbox)
-            .await
-            .unwrap();
+        crate::modules::calendar::events::invalidate(&s.state, PID);
+        run(&s.state, PID, NINE + 2700, &s.outbox).await.unwrap();
         assert_eq!(s.outbox.take().len(), 1);
 
         // Started events are never reminded.
-        run(&s.state, GUILD_ID, NINE + 3700, &s.outbox)
-            .await
-            .unwrap();
+        run(&s.state, PID, NINE + 3700, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty());
     }
 
@@ -820,7 +817,7 @@ pub mod tests {
     async fn tasks_added_after_the_last_read_are_seen_within_a_minute() {
         let s = setup().await;
         add_rule(&s, &reminder()).await;
-        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE, &s.outbox).await.unwrap();
         let reads = s.mock.requests().len();
 
         // Someone adds a meeting starting in 5 minutes right after the bot read the list.
@@ -828,13 +825,13 @@ pub mod tests {
             mock::LIST_ID,
             vec![task_at("new", "Quick sync", NINE + 360)],
         );
-        run(&s.state, GUILD_ID, NINE + 30, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 30, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "the last read is still fresh");
         assert_eq!(s.mock.requests().len(), reads);
 
         // A minute later the bot reads again and reminds.
         s.state.cache.backdate(std::time::Duration::from_secs(60));
-        run(&s.state, GUILD_ID, NINE + 60, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 60, &s.outbox).await.unwrap();
         assert_eq!(s.outbox.take().len(), 1);
     }
 
@@ -849,7 +846,7 @@ pub mod tests {
         let mut nowhere = reminder();
         nowhere.channel_id = None;
         add_rule(&s, &nowhere).await;
-        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty());
         assert!(
             s.mock.requests().is_empty(),
@@ -857,10 +854,10 @@ pub mod tests {
         );
 
         add_rule(&s, &reminder()).await;
-        save_config(&s.state.db, GUILD_ID, &CalendarConfig::default(), "root")
+        save_config(&s.state.db, PID, &CalendarConfig::default(), "root")
             .await
             .unwrap();
-        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty(), "no list selected");
     }
 
@@ -873,21 +870,19 @@ pub mod tests {
 
         // ClickUp down: nothing posted, nothing marked, the API error is counted.
         s.mock.fail_with(Some(503));
-        run(&s.state, GUILD_ID, NINE, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty());
         assert_eq!(count(&s, "api_err").await, 1);
         s.mock.fail_with(None);
 
         // Discord refuses: counted as failed and not retried.
         *s.outbox.fail.lock().unwrap() = Some("Missing Permissions".into());
-        run(&s.state, GUILD_ID, NINE + 60, &s.outbox).await.unwrap();
+        run(&s.state, PID, NINE + 60, &s.outbox).await.unwrap();
         *s.outbox.fail.lock().unwrap() = None;
-        run(&s.state, GUILD_ID, NINE + 120, &s.outbox)
-            .await
-            .unwrap();
+        run(&s.state, PID, NINE + 120, &s.outbox).await.unwrap();
         assert!(s.outbox.take().is_empty());
         assert_eq!(count(&s, "failed").await, 1);
-        let log = recent_log(&s.state.db, GUILD_ID, 5).await.unwrap();
+        let log = recent_log(&s.state.db, PID, 5).await.unwrap();
         assert_eq!(log[0].error.as_deref(), Some("Missing Permissions"));
     }
 
@@ -898,29 +893,29 @@ pub mod tests {
             .set_tasks(mock::LIST_ID, vec![task_at("a", "Standup", NINE + 1800)]);
         let rule = add_rule(&s, &reminder()).await;
 
-        let outcome = send_test(&s.state, GUILD_ID, &rule, &s.outbox, NINE)
+        let outcome = send_test(&s.state, PID, &rule, &s.outbox, NINE)
             .await
             .unwrap();
         assert_eq!(outcome, TestOutcome::Sent);
         assert_eq!(s.outbox.take().len(), 1);
         assert_eq!(count(&s, "reminders").await, 0);
-        assert!(recent_log(&s.state.db, GUILD_ID, 1).await.unwrap()[0].is_test);
+        assert!(recent_log(&s.state.db, PID, 1).await.unwrap()[0].is_test);
         assert!(
             !was_sent(&s.state.db, rule.id, "a", NINE + 1800)
                 .await
                 .unwrap()
         );
 
-        let text = preview(&s.state, GUILD_ID, &rule, NINE).await.unwrap();
+        let text = preview(&s.state, PID, &rule, NINE).await.unwrap();
         assert!(text.starts_with("Standup @Anna Nowak"), "{text}");
 
         // Without a list the preview falls back to a sample, the test reports the problem.
-        save_config(&s.state.db, GUILD_ID, &CalendarConfig::default(), "root")
+        save_config(&s.state.db, PID, &CalendarConfig::default(), "root")
             .await
             .unwrap();
-        let text = preview(&s.state, GUILD_ID, &rule, NINE).await.unwrap();
+        let text = preview(&s.state, PID, &rule, NINE).await.unwrap();
         assert!(text.starts_with("Weekly sync"), "{text}");
-        let outcome = send_test(&s.state, GUILD_ID, &rule, &s.outbox, NINE)
+        let outcome = send_test(&s.state, PID, &rule, &s.outbox, NINE)
             .await
             .unwrap();
         assert_eq!(outcome, TestOutcome::Fetch(FetchError::NoList));

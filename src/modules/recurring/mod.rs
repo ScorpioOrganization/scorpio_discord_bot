@@ -20,9 +20,10 @@ use jiff::tz::TimeZone;
 use sqlx::SqlitePool;
 
 use super::{Module, StatItem, counter};
-use crate::db::{now, sf};
+use crate::db::now;
+use crate::keys::Service;
 use crate::modules::calendar::schedule::parse_tz;
-use crate::state::{AppState, DiscordHandle};
+use crate::state::AppState;
 use crate::web::fmt_ts;
 
 pub const ID: &str = "recurring";
@@ -55,16 +56,23 @@ impl Module for RecurringModule {
         "Moves tagged ClickUp tasks to their next date when ClickUp's own recurrence does not."
     }
 
-    async fn summary(&self, state: &AppState, guild_id: u64) -> Result<Vec<StatItem>> {
-        let cfg = load_config(&state.db, guild_id).await?;
-        let active = list_rules(&state.db, guild_id)
+    fn services(&self) -> &'static [Service] {
+        &[Service::ClickUp]
+    }
+
+    async fn summary(&self, state: &AppState, project_id: i64) -> Result<Vec<StatItem>> {
+        let cfg = load_config(&state.db, project_id).await?;
+        let active = list_rules(&state.db, project_id)
             .await?
             .iter()
             .filter(|r| r.enabled)
             .count();
         Ok(vec![
             StatItem::new("Active rules", active),
-            StatItem::new("Tasks recurred", recurred(&state.db, Some(guild_id)).await?),
+            StatItem::new(
+                "Tasks recurred",
+                recurred(&state.db, Some(project_id)).await?,
+            ),
             StatItem::new("Mode", if cfg.dry_run { "Dry run" } else { "Live" }),
             StatItem::new(
                 "Last run",
@@ -83,20 +91,15 @@ impl Module for RecurringModule {
         true
     }
 
-    async fn on_tick(
-        &self,
-        state: &AppState,
-        _discord: &DiscordHandle,
-        guild_id: u64,
-    ) -> Result<()> {
-        runner::run(state, guild_id, now(), false).await?;
+    async fn on_tick(&self, state: &AppState, project_id: i64) -> Result<()> {
+        runner::run(state, project_id, now(), false).await?;
         Ok(())
     }
 }
 
 /// Tasks moved or copied, for one guild or all of them.
-pub async fn recurred(db: &SqlitePool, guild_id: Option<u64>) -> Result<i64> {
-    Ok(counter(db, guild_id, ID, "moved").await? + counter(db, guild_id, ID, "copied").await?)
+pub async fn recurred(db: &SqlitePool, project_id: Option<i64>) -> Result<i64> {
+    Ok(counter(db, project_id, ID, "moved").await? + counter(db, project_id, ID, "copied").await?)
 }
 
 // ---------------------------------------------------------------- config
@@ -146,12 +149,12 @@ struct ConfigRow {
     last_run_at: Option<i64>,
 }
 
-pub async fn load_config(db: &SqlitePool, guild_id: u64) -> Result<RecurringConfig> {
+pub async fn load_config(db: &SqlitePool, project_id: i64) -> Result<RecurringConfig> {
     let row: Option<ConfigRow> = sqlx::query_as(
         "SELECT team_id, team_name, timezone, check_minutes, dry_run, last_run_at
-         FROM recurring_config WHERE guild_id = ?",
+         FROM recurring_config WHERE project_id = ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_optional(db)
     .await?;
     Ok(row
@@ -169,16 +172,16 @@ pub async fn load_config(db: &SqlitePool, guild_id: u64) -> Result<RecurringConf
 /// Saves the settings. Leaves `last_run_at` alone.
 pub async fn save_config(
     db: &SqlitePool,
-    guild_id: u64,
+    project_id: i64,
     cfg: &RecurringConfig,
     by: &str,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO recurring_config
-             (guild_id, team_id, team_name, timezone, check_minutes, dry_run, updated_at,
+             (project_id, team_id, team_name, timezone, check_minutes, dry_run, updated_at,
               updated_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (guild_id) DO UPDATE SET
+         ON CONFLICT (project_id) DO UPDATE SET
              team_id = excluded.team_id,
              team_name = excluded.team_name,
              timezone = excluded.timezone,
@@ -187,7 +190,7 @@ pub async fn save_config(
              updated_at = excluded.updated_at,
              updated_by = excluded.updated_by",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(cfg.team_id.clone())
     .bind(cfg.team_name.clone())
     .bind(cfg.timezone.clone())
@@ -200,32 +203,32 @@ pub async fn save_config(
     Ok(())
 }
 
-pub async fn set_last_run(db: &SqlitePool, guild_id: u64, at: i64) -> Result<()> {
-    sqlx::query("UPDATE recurring_config SET last_run_at = ? WHERE guild_id = ?")
+pub async fn set_last_run(db: &SqlitePool, project_id: i64, at: i64) -> Result<()> {
+    sqlx::query("UPDATE recurring_config SET last_run_at = ? WHERE project_id = ?")
         .bind(at)
-        .bind(sf(guild_id))
+        .bind(project_id)
         .execute(db)
         .await?;
     Ok(())
 }
 
 /// Takes the guild's run lock. False when another run holds it.
-pub async fn try_lock(db: &SqlitePool, guild_id: u64, at: i64) -> Result<bool> {
+pub async fn try_lock(db: &SqlitePool, project_id: i64, at: i64) -> Result<bool> {
     let res = sqlx::query(
         "UPDATE recurring_config SET running_since = ?
-         WHERE guild_id = ? AND (running_since IS NULL OR running_since < ?)",
+         WHERE project_id = ? AND (running_since IS NULL OR running_since < ?)",
     )
     .bind(at)
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(at - STALE_LOCK_SECS)
     .execute(db)
     .await?;
     Ok(res.rows_affected() == 1)
 }
 
-pub async fn unlock(db: &SqlitePool, guild_id: u64) -> Result<()> {
-    sqlx::query("UPDATE recurring_config SET running_since = NULL WHERE guild_id = ?")
-        .bind(sf(guild_id))
+pub async fn unlock(db: &SqlitePool, project_id: i64) -> Result<()> {
+    sqlx::query("UPDATE recurring_config SET running_since = NULL WHERE project_id = ?")
+        .bind(project_id)
         .execute(db)
         .await?;
     Ok(())
@@ -422,43 +425,48 @@ const RULE_COLUMNS: &str =
 
 /// Rules of a guild, oldest first: when a task has the tags of several rules, the oldest
 /// rule decides.
-pub async fn list_rules(db: &SqlitePool, guild_id: u64) -> Result<Vec<Rule>> {
+pub async fn list_rules(db: &SqlitePool, project_id: i64) -> Result<Vec<Rule>> {
     let rows: Vec<RuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE guild_id = ? ORDER BY id"
+        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE project_id = ? ORDER BY id"
     )))
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_all(db)
     .await?;
     Ok(rows.into_iter().map(Rule::from).collect())
 }
 
 /// A rule of this guild. Ids of other guilds' rules return None.
-pub async fn load_rule(db: &SqlitePool, guild_id: u64, rule_id: i64) -> Result<Option<Rule>> {
+pub async fn load_rule(db: &SqlitePool, project_id: i64, rule_id: i64) -> Result<Option<Rule>> {
     let row: Option<RuleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE guild_id = ? AND id = ?"
+        "SELECT {RULE_COLUMNS} FROM recurring_rules WHERE project_id = ? AND id = ?"
     )))
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(rule_id)
     .fetch_optional(db)
     .await?;
     Ok(row.map(Rule::from))
 }
 
-pub async fn count_rules(db: &SqlitePool, guild_id: u64) -> Result<i64> {
+pub async fn count_rules(db: &SqlitePool, project_id: i64) -> Result<i64> {
     Ok(
-        sqlx::query_scalar("SELECT COUNT(*) FROM recurring_rules WHERE guild_id = ?")
-            .bind(sf(guild_id))
+        sqlx::query_scalar("SELECT COUNT(*) FROM recurring_rules WHERE project_id = ?")
+            .bind(project_id)
             .fetch_one(db)
             .await?,
     )
 }
 
 /// Another rule of the guild already uses `tag`.
-pub async fn tag_taken(db: &SqlitePool, guild_id: u64, tag: &str, except_id: i64) -> Result<bool> {
+pub async fn tag_taken(
+    db: &SqlitePool,
+    project_id: i64,
+    tag: &str,
+    except_id: i64,
+) -> Result<bool> {
     let found: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM recurring_rules WHERE guild_id = ? AND tag = ? AND id != ?",
+        "SELECT 1 FROM recurring_rules WHERE project_id = ? AND tag = ? AND id != ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(tag.to_owned())
     .bind(except_id)
     .fetch_optional(db)
@@ -466,14 +474,14 @@ pub async fn tag_taken(db: &SqlitePool, guild_id: u64, tag: &str, except_id: i64
     Ok(found.is_some())
 }
 
-pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) -> Result<i64> {
+pub async fn insert_rule(db: &SqlitePool, project_id: i64, rule: &Rule, by: &str) -> Result<i64> {
     let res = sqlx::query(
         "INSERT INTO recurring_rules
-             (guild_id, name, enabled, tag, every, unit, trigger_on, mode, reopen_status,
+             (project_id, name, enabled, tag, every, unit, trigger_on, mode, reopen_status,
               shift_start, created_at, updated_at, updated_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(rule.name.clone())
     .bind(rule.enabled)
     .bind(rule.tag.clone())
@@ -492,12 +500,12 @@ pub async fn insert_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
 }
 
 /// Saves every editable field of `rule` (matched by id and guild).
-pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) -> Result<()> {
+pub async fn update_rule(db: &SqlitePool, project_id: i64, rule: &Rule, by: &str) -> Result<()> {
     sqlx::query(
         "UPDATE recurring_rules SET
              name = ?, enabled = ?, tag = ?, every = ?, unit = ?, trigger_on = ?, mode = ?,
              reopen_status = ?, shift_start = ?, updated_at = ?, updated_by = ?
-         WHERE guild_id = ? AND id = ?",
+         WHERE project_id = ? AND id = ?",
     )
     .bind(rule.name.clone())
     .bind(rule.enabled)
@@ -510,16 +518,16 @@ pub async fn update_rule(db: &SqlitePool, guild_id: u64, rule: &Rule, by: &str) 
     .bind(rule.shift_start)
     .bind(now())
     .bind(by.to_owned())
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(rule.id)
     .execute(db)
     .await?;
     Ok(())
 }
 
-pub async fn delete_rule(db: &SqlitePool, guild_id: u64, rule_id: i64) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM recurring_rules WHERE guild_id = ? AND id = ?")
-        .bind(sf(guild_id))
+pub async fn delete_rule(db: &SqlitePool, project_id: i64, rule_id: i64) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM recurring_rules WHERE project_id = ? AND id = ?")
+        .bind(project_id)
         .bind(rule_id)
         .execute(db)
         .await?;
@@ -529,10 +537,10 @@ pub async fn delete_rule(db: &SqlitePool, guild_id: u64, rule_id: i64) -> Result
 // ---------------------------------------------------------------- handled occurrences
 
 /// (task id, due date in ms) of every occurrence handled recently.
-pub async fn done_markers(db: &SqlitePool, guild_id: u64) -> Result<HashSet<(String, i64)>> {
+pub async fn done_markers(db: &SqlitePool, project_id: i64) -> Result<HashSet<(String, i64)>> {
     let rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT task_id, due_ms FROM recurring_done WHERE guild_id = ?")
-            .bind(sf(guild_id))
+        sqlx::query_as("SELECT task_id, due_ms FROM recurring_done WHERE project_id = ?")
+            .bind(project_id)
             .fetch_all(db)
             .await?;
     Ok(rows.into_iter().collect())
@@ -541,7 +549,7 @@ pub async fn done_markers(db: &SqlitePool, guild_id: u64) -> Result<HashSet<(Str
 /// Records a handled occurrence, or adds the copy's id to one recorded before.
 pub async fn mark_done(
     db: &SqlitePool,
-    guild_id: u64,
+    project_id: i64,
     task_id: &str,
     due_ms: i64,
     rule_id: i64,
@@ -549,13 +557,13 @@ pub async fn mark_done(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO recurring_done
-             (guild_id, task_id, due_ms, rule_id, new_task_id, done_at)
+             (project_id, task_id, due_ms, rule_id, new_task_id, done_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (guild_id, task_id, due_ms) DO UPDATE SET
+         ON CONFLICT (project_id, task_id, due_ms) DO UPDATE SET
              new_task_id = COALESCE(excluded.new_task_id, new_task_id),
              done_at = excluded.done_at",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(task_id.to_owned())
     .bind(due_ms)
     .bind(rule_id)
@@ -566,9 +574,14 @@ pub async fn mark_done(
     Ok(())
 }
 
-pub async fn unmark_done(db: &SqlitePool, guild_id: u64, task_id: &str, due_ms: i64) -> Result<()> {
-    sqlx::query("DELETE FROM recurring_done WHERE guild_id = ? AND task_id = ? AND due_ms = ?")
-        .bind(sf(guild_id))
+pub async fn unmark_done(
+    db: &SqlitePool,
+    project_id: i64,
+    task_id: &str,
+    due_ms: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM recurring_done WHERE project_id = ? AND task_id = ? AND due_ms = ?")
+        .bind(project_id)
         .bind(task_id.to_owned())
         .bind(due_ms)
         .execute(db)
@@ -593,7 +606,7 @@ pub struct LogEntry<'a> {
 /// Writes a log row. A dry run or failure that is already logged for the same occurrence
 /// is not logged again, so runs every few minutes do not fill the log. Returns whether a
 /// row was written.
-pub async fn log(db: &SqlitePool, guild_id: u64, entry: LogEntry<'_>) -> Result<bool> {
+pub async fn log(db: &SqlitePool, project_id: i64, entry: LogEntry<'_>) -> Result<bool> {
     let error = entry.error.map(|mut e| {
         e.truncate(e.floor_char_boundary(300));
         e
@@ -602,10 +615,10 @@ pub async fn log(db: &SqlitePool, guild_id: u64, entry: LogEntry<'_>) -> Result<
     if entry.dry_run || !success {
         let seen: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM recurring_log
-             WHERE guild_id = ? AND task_id = ? AND old_due = ? AND new_due = ? AND dry_run = ?
+             WHERE project_id = ? AND task_id = ? AND old_due = ? AND new_due = ? AND dry_run = ?
                AND success = ? AND error IS ?",
         )
-        .bind(sf(guild_id))
+        .bind(project_id)
         .bind(entry.task_id.to_owned())
         .bind(entry.old_due)
         .bind(entry.new_due)
@@ -620,11 +633,11 @@ pub async fn log(db: &SqlitePool, guild_id: u64, entry: LogEntry<'_>) -> Result<
     }
     sqlx::query(
         "INSERT INTO recurring_log
-             (guild_id, rule_id, rule_name, task_id, task_name, task_url, old_due, new_due,
+             (project_id, rule_id, rule_name, task_id, task_name, task_url, old_due, new_due,
               mode, dry_run, success, error, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(entry.rule.id)
     .bind(entry.rule.name.clone())
     .bind(entry.task_id.to_owned())
@@ -656,13 +669,13 @@ pub struct LogRow {
     pub created_at: i64,
 }
 
-pub async fn recent_log(db: &SqlitePool, guild_id: u64, limit: i64) -> Result<Vec<LogRow>> {
+pub async fn recent_log(db: &SqlitePool, project_id: i64, limit: i64) -> Result<Vec<LogRow>> {
     Ok(sqlx::query_as(
         "SELECT rule_name, task_name, task_url, old_due, new_due, mode, dry_run, success, error,
                 created_at
-         FROM recurring_log WHERE guild_id = ? ORDER BY id DESC LIMIT ?",
+         FROM recurring_log WHERE project_id = ? ORDER BY id DESC LIMIT ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(limit)
     .fetch_all(db)
     .await?)

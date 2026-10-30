@@ -3,8 +3,8 @@
 {% block content %}
 <nav class="crumbs">
   <a href="/">Overview</a><span>/</span>
-  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
-  <a href="/guilds/{{ guild.id }}/modules/calendar">Calendar</a><span>/</span>
+  <a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span>
+  <a href="/projects/{{ project.id }}/modules/calendar">Calendar</a><span>/</span>
   <span>{% if is_new %}New {{ rule.kind.label() }}{% else %}{{ rule.name }}{% endif %}</span>
 </nav>
 
@@ -22,7 +22,7 @@
 {% endfor %}
 
 <div class="two-col">
-  <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules{% if !is_new %}/{{ rule.id }}{% endif %}">
+  <form class="card form" method="post" action="/projects/{{ project.id }}/modules/calendar/rules{% if !is_new %}/{{ rule.id }}{% endif %}">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">
     {% if is_new %}<input type="hidden" name="kind" value="{{ rule.kind.as_str() }}">{% endif %}
 
@@ -156,7 +156,7 @@
 
     <div class="actions">
       <button class="btn btn-primary" type="submit">{% if is_new %}Create rule{% else %}Save rule{% endif %}</button>
-      <a class="btn btn-ghost" href="/guilds/{{ guild.id }}/modules/calendar">Back</a>
+      <a class="btn btn-ghost" href="/projects/{{ project.id }}/modules/calendar">Back</a>
     </div>
   </form>
 
@@ -170,7 +170,7 @@
       {% endif %}
       <p class="hint">{% if is_digest %}The next scheduled post of the saved rule{% else %}The saved rule{% endif %} with current events from ClickUp (or a sample event). Times are shown in {{ timezone }}; in Discord everyone sees their own time zone.</p>
       {% if !is_new %}
-      <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules/{{ rule.id }}/test" class="actions">
+      <form method="post" action="/projects/{{ project.id }}/modules/calendar/rules/{{ rule.id }}/test" class="actions">
         <input type="hidden" name="_csrf" value="{{ page.csrf }}">
         <button class="btn btn-secondary" type="submit">Send test message</button>
       </form>
@@ -194,7 +194,7 @@
     </section>
 
     {% if !is_new %}
-    <form method="post" action="/guilds/{{ guild.id }}/modules/calendar/rules/{{ rule.id }}/delete" class="actions" data-confirm="Delete this rule?">
+    <form method="post" action="/projects/{{ project.id }}/modules/calendar/rules/{{ rule.id }}/delete" class="actions" data-confirm="Delete this rule?">
       <input type="hidden" name="_csrf" value="{{ page.csrf }}">
       <button class="btn btn-danger" type="submit">Delete rule</button>
     </form>

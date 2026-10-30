@@ -16,7 +16,7 @@ use super::{
 };
 use crate::clickup::ClickUpError;
 use crate::clickup::client::{NewTask, Priority, Task, TaskQuery, TaskUpdate};
-use crate::clickup::tokens::{self, Credential, TokenProblem};
+use crate::keys::{self, Credential, KeyProblem, Service};
 use crate::modules::bump_counter;
 use crate::state::AppState;
 
@@ -34,7 +34,7 @@ const WRITE_BUDGET: Duration = Duration::from_secs(30);
 pub enum Problem {
     NoWorkspace,
     NoRules,
-    Token(TokenProblem),
+    Token(KeyProblem),
     Api(ClickUpError),
 }
 
@@ -43,7 +43,7 @@ impl Problem {
         match self {
             Problem::NoWorkspace => "No ClickUp workspace is selected.".into(),
             Problem::NoRules => "There is no active rule.".into(),
-            Problem::Token(p) => p.message().into(),
+            Problem::Token(p) => p.message(Service::ClickUp).into(),
             Problem::Api(e) => e.to_string(),
         }
     }
@@ -53,9 +53,9 @@ impl Problem {
         match self {
             Problem::NoWorkspace => "recurring_no_workspace",
             Problem::NoRules => "recurring_no_rules",
-            Problem::Token(TokenProblem::NotSet) => "token_missing",
-            Problem::Token(TokenProblem::Unreadable) => "token_unreadable",
-            Problem::Token(TokenProblem::SharedModuleDisabled) => "clickup_disabled",
+            Problem::Token(KeyProblem::NotSet) => "token_missing",
+            Problem::Token(KeyProblem::Unreadable) => "token_unreadable",
+            Problem::Token(KeyProblem::SharedModuleDisabled) => "clickup_disabled",
             Problem::Api(ClickUpError::Unauthorized) => "token_check_failed",
             Problem::Api(_) => "clickup_unreachable",
         }
@@ -93,38 +93,38 @@ pub struct Fetched {
 /// Runs the module for a guild, unless the check interval has not passed (`force` skips
 /// that check, for "Run now"). A run that hits a problem still counts as a run, so a broken
 /// key is not retried every minute.
-pub async fn run(state: &AppState, guild_id: u64, now: i64, force: bool) -> Result<Outcome> {
-    let cfg = load_config(&state.db, guild_id).await?;
+pub async fn run(state: &AppState, project_id: i64, now: i64, force: bool) -> Result<Outcome> {
+    let cfg = load_config(&state.db, project_id).await?;
     let Some(team_id) = cfg.team_id.clone() else {
         return Ok(Outcome::Problem(Problem::NoWorkspace));
     };
-    let rules = active_rules(state, guild_id).await?;
+    let rules = active_rules(state, project_id).await?;
     if rules.is_empty() {
         return Ok(Outcome::Problem(Problem::NoRules));
     }
     if !force && cfg.next_run_at().is_some_and(|at| at > now) {
         return Ok(Outcome::NotDue);
     }
-    if !try_lock(&state.db, guild_id, now).await? {
+    if !try_lock(&state.db, project_id, now).await? {
         return Ok(Outcome::Busy);
     }
-    let outcome = locked_run(state, guild_id, now, &cfg, &team_id, &rules).await;
-    set_last_run(&state.db, guild_id, now).await?;
-    unlock(&state.db, guild_id).await?;
-    invalidate_preview(state, guild_id);
+    let outcome = locked_run(state, project_id, now, &cfg, &team_id, &rules).await;
+    set_last_run(&state.db, project_id, now).await?;
+    unlock(&state.db, project_id).await?;
+    invalidate_preview(state, project_id);
     let outcome = outcome?;
     match &outcome {
-        Outcome::Problem(p) => tracing::debug!(guild_id, problem = ?p, "recurring run skipped"),
+        Outcome::Problem(p) => tracing::debug!(project_id, problem = ?p, "recurring run skipped"),
         Outcome::Done(r) if r.changed + r.failed > 0 => {
-            tracing::info!(guild_id, report = ?r, "recurring run done");
+            tracing::info!(project_id, report = ?r, "recurring run done");
         }
         _ => {}
     }
     Ok(outcome)
 }
 
-async fn active_rules(state: &AppState, guild_id: u64) -> Result<Vec<Rule>> {
-    Ok(list_rules(&state.db, guild_id)
+async fn active_rules(state: &AppState, project_id: i64) -> Result<Vec<Rule>> {
+    Ok(list_rules(&state.db, project_id)
         .await?
         .into_iter()
         .filter(|r| r.enabled)
@@ -133,23 +133,23 @@ async fn active_rules(state: &AppState, guild_id: u64) -> Result<Vec<Rule>> {
 
 async fn locked_run(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     now: i64,
     cfg: &RecurringConfig,
     team_id: &str,
     rules: &[Rule],
 ) -> Result<Outcome> {
-    let cred = match tokens::resolve(state, guild_id, ID).await? {
+    let cred = match keys::resolve(state, project_id, Service::ClickUp, ID).await? {
         Ok(c) => c,
         Err(p) => return Ok(Outcome::Problem(Problem::Token(p))),
     };
     let now_ms = now * 1000;
-    let fetched = match fetch(state, guild_id, &cred, team_id, rules, now_ms).await {
+    let fetched = match fetch(state, project_id, &cred, team_id, rules, now_ms).await {
         Ok(f) => f,
         Err(e) => return Ok(Outcome::Problem(Problem::Api(e))),
     };
     let tz = cfg.tz();
-    let done = done_markers(&state.db, guild_id).await?;
+    let done = done_markers(&state.db, project_id).await?;
     let plan = plan::plan(&fetched.rules, now_ms, &tz, &done, MAX_WRITES_PER_RUN);
     let mut report = Report {
         dry_run: cfg.dry_run,
@@ -170,7 +170,7 @@ async fn locked_run(
         if claim {
             mark_done(
                 &state.db,
-                guild_id,
+                project_id,
                 &item.task.id,
                 item.old_due,
                 item.rule.id,
@@ -181,7 +181,7 @@ async fn locked_run(
         let result = if cfg.dry_run {
             Ok(None)
         } else {
-            apply(state, guild_id, &cred, &tz, item).await
+            apply(state, project_id, &cred, &tz, item).await
         };
         let entry = LogEntry {
             rule: &item.rule,
@@ -193,7 +193,7 @@ async fn locked_run(
             dry_run: cfg.dry_run,
             error: result.as_ref().err().map(ToString::to_string),
         };
-        let logged = log(&state.db, guild_id, entry).await?;
+        let logged = log(&state.db, project_id, entry).await?;
         match result {
             Ok(new_task) => {
                 report.changed += 1;
@@ -202,7 +202,7 @@ async fn locked_run(
                     let rule_id = item.rule.id;
                     mark_done(
                         &state.db,
-                        guild_id,
+                        project_id,
                         task_id,
                         item.old_due,
                         rule_id,
@@ -213,7 +213,7 @@ async fn locked_run(
                         Mode::Update => "moved",
                         Mode::Create => "copied",
                     };
-                    bump_counter(&state.db, guild_id, ID, key).await?;
+                    bump_counter(&state.db, project_id, ID, key).await?;
                 }
             }
             Err(e) => {
@@ -228,11 +228,11 @@ async fn locked_run(
                         | ClickUpError::RateLimited
                 );
                 if claim && refused {
-                    unmark_done(&state.db, guild_id, &item.task.id, item.old_due).await?;
+                    unmark_done(&state.db, project_id, &item.task.id, item.old_due).await?;
                 }
                 // A failure that repeats every run is counted once, like it is logged once.
                 if logged {
-                    bump_counter(&state.db, guild_id, ID, "failed").await?;
+                    bump_counter(&state.db, project_id, ID, "failed").await?;
                 }
                 // The remaining tasks would fail the same way, leave them for the next run.
                 if matches!(
@@ -252,7 +252,7 @@ async fn locked_run(
 /// Reads the tasks of each rule's tag in the workspace.
 async fn fetch(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     cred: &Credential,
     team_id: &str,
     rules: &[Rule],
@@ -277,7 +277,7 @@ async fn fetch(
             .clickup
             .team_tasks(&cred.token, team_id, &query, MAX_PAGES)
             .await;
-        let (tasks, cut) = tokens::track(&state.db, guild_id, ID, cred, result).await?;
+        let (tasks, cut) = keys::track(&state.db, project_id, ID, cred, result).await?;
         fetched.truncated |= cut;
         fetched.rules.push((rule.clone(), tasks));
     }
@@ -287,7 +287,7 @@ async fn fetch(
 /// Moves or copies one task. Returns the id of the copy.
 async fn apply(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     cred: &Credential,
     tz: &TimeZone,
     item: &Planned,
@@ -299,7 +299,7 @@ async fn apply(
         .map(|l| l.id.clone())
         .ok_or_else(|| ClickUpError::Decode("the task has no list".into()))?;
     let status = match item.rule.reopen_status.as_str() {
-        "" => open_status(state, guild_id, cred, &list_id).await?,
+        "" => open_status(state, project_id, cred, &list_id).await?,
         name => name.to_owned(),
     };
     let client = &state.clickup;
@@ -313,13 +313,13 @@ async fn apply(
             let result = client
                 .update_task(&cred.token, &item.task.id, &update)
                 .await;
-            tokens::track(&state.db, guild_id, ID, cred, result).await?;
+            keys::track(&state.db, project_id, ID, cred, result).await?;
             Ok(None)
         }
         Mode::Create => {
             let task = new_task(item, status, tz);
             let result = client.create_task(&cred.token, &list_id, &task).await;
-            let created = tokens::track(&state.db, guild_id, ID, cred, result).await?;
+            let created = keys::track(&state.db, project_id, ID, cred, result).await?;
             Ok(Some(created.id))
         }
     }
@@ -354,16 +354,16 @@ fn new_task(item: &Planned, status: String, tz: &TimeZone) -> NewTask {
 /// The first open status of a list, which ClickUp's own recurrence also returns to.
 async fn open_status(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     cred: &Credential,
     list_id: &str,
 ) -> Result<String, ClickUpError> {
-    let key = format!("recurring:status:{guild_id}:{list_id}");
+    let key = format!("recurring:status:{project_id}:{list_id}");
     if let Some(hit) = state.cache.get::<String>(&key, STATUS_MAX_AGE) {
         return Ok((*hit).clone());
     }
     let result = state.clickup.list(&cred.token, list_id).await;
-    let list = tokens::track(&state.db, guild_id, ID, cred, result).await?;
+    let list = keys::track(&state.db, project_id, ID, cred, result).await?;
     let status = list
         .statuses
         .iter()
@@ -380,42 +380,42 @@ async fn open_status(
 /// changes anything in ClickUp.
 pub async fn preview(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     now: i64,
 ) -> Result<Result<(Plan, bool), Problem>> {
-    let cfg = load_config(&state.db, guild_id).await?;
+    let cfg = load_config(&state.db, project_id).await?;
     let Some(team_id) = cfg.team_id.clone() else {
         return Ok(Err(Problem::NoWorkspace));
     };
-    let rules = active_rules(state, guild_id).await?;
+    let rules = active_rules(state, project_id).await?;
     if rules.is_empty() {
         return Ok(Err(Problem::NoRules));
     }
-    let cred = match tokens::resolve(state, guild_id, ID).await? {
+    let cred = match keys::resolve(state, project_id, Service::ClickUp, ID).await? {
         Ok(c) => c,
         Err(p) => return Ok(Err(Problem::Token(p))),
     };
     // Keyed by the key itself, so a replaced key never shows the old account's tasks.
     let fingerprint = &crate::auth::hash_token(cred.token.expose())[..16];
-    let key = format!("recurring:preview:{guild_id}:{fingerprint}");
+    let key = format!("recurring:preview:{project_id}:{fingerprint}");
     let now_ms = now * 1000;
     let fetched = match state.cache.get::<Fetched>(&key, PREVIEW_MAX_AGE) {
         Some(hit) => hit,
-        None => match fetch(state, guild_id, &cred, &team_id, &rules, now_ms).await {
+        None => match fetch(state, project_id, &cred, &team_id, &rules, now_ms).await {
             Ok(f) => state.cache.insert(key, f),
             Err(e) => return Ok(Err(Problem::Api(e))),
         },
     };
-    let done: HashSet<_> = done_markers(&state.db, guild_id).await?;
+    let done: HashSet<_> = done_markers(&state.db, project_id).await?;
     let plan = plan::plan(&fetched.rules, now_ms, &cfg.tz(), &done, MAX_WRITES_PER_RUN);
     Ok(Ok((plan, fetched.truncated)))
 }
 
 /// Drops the tasks the preview read, after settings, rules or tasks changed.
-pub fn invalidate_preview(state: &AppState, guild_id: u64) {
+pub fn invalidate_preview(state: &AppState, project_id: i64) {
     state
         .cache
-        .remove_prefix(&format!("recurring:preview:{guild_id}:"));
+        .remove_prefix(&format!("recurring:preview:{project_id}:"));
 }
 
 #[cfg(test)]
@@ -429,7 +429,7 @@ mod tests {
     };
     use crate::modules::{counter, set_enabled};
     use crate::secrets::SecretString;
-    use crate::test_util::{self, GUILD_ID};
+    use crate::test_util::{self, PID};
 
     const DAY: i64 = 86_400;
     // Thursday 2026-10-15 09:00:00 UTC.
@@ -446,15 +446,14 @@ mod tests {
         let mock = MockClickUp::start().await;
         state.clickup = mock.client();
         let db = &state.db;
-        set_enabled(db, GUILD_ID, tokens::SHARED, true)
-            .await
-            .unwrap();
+        set_enabled(db, PID, "clickup", true).await.unwrap();
         let key = SecretString::new(mock::TOKEN);
-        tokens::store(
+        keys::store(
             db,
             &state.vault,
-            GUILD_ID,
-            tokens::SHARED,
+            PID,
+            Service::ClickUp,
+            "clickup",
             &key,
             "Owner",
             "root",
@@ -467,7 +466,7 @@ mod tests {
             dry_run: false,
             ..Default::default()
         };
-        save_config(db, GUILD_ID, &cfg, "root").await.unwrap();
+        save_config(db, PID, &cfg, "root").await.unwrap();
         Setup { state, mock }
     }
 
@@ -478,9 +477,7 @@ mod tests {
             ..Rule::new()
         };
         edit(&mut rule);
-        rule.id = insert_rule(&s.state.db, GUILD_ID, &rule, "root")
-            .await
-            .unwrap();
+        rule.id = insert_rule(&s.state.db, PID, &rule, "root").await.unwrap();
         rule
     }
 
@@ -500,7 +497,7 @@ mod tests {
     }
 
     async fn stat(s: &Setup, key: &str) -> i64 {
-        counter(&s.state.db, Some(GUILD_ID), ID, key).await.unwrap()
+        counter(&s.state.db, Some(PID), ID, key).await.unwrap()
     }
 
     #[tokio::test]
@@ -518,7 +515,7 @@ mod tests {
             ],
         );
 
-        let r = report(run(&s.state, GUILD_ID, NOW, false).await.unwrap());
+        let r = report(run(&s.state, PID, NOW, false).await.unwrap());
         assert_eq!((r.changed, r.failed, r.dry_run), (2, 0, false));
 
         let fetch = &s.mock.requests()[0];
@@ -559,14 +556,14 @@ mod tests {
         assert_eq!(stored[0]["status"]["status"], "to do");
         assert_eq!(stored[0]["due_date"], ((NOW + 6 * DAY) * 1000).to_string());
         assert_eq!(stat(&s, "moved").await, 2);
-        let log = recent_log(&s.state.db, GUILD_ID, 10).await.unwrap();
+        let log = recent_log(&s.state.db, PID, 10).await.unwrap();
         assert_eq!(log.len(), 2);
         assert!(log.iter().all(|l| l.success && !l.dry_run));
         let t1 = log.iter().find(|l| l.task_name == "Task t1").unwrap();
         assert_eq!((t1.old_due, t1.new_due), (NOW - DAY, NOW + 6 * DAY));
 
         // Reopened tasks do not match any more.
-        let r = report(run(&s.state, GUILD_ID, NOW + 60, true).await.unwrap());
+        let r = report(run(&s.state, PID, NOW + 60, true).await.unwrap());
         assert_eq!(r.changed, 0);
         assert_eq!(s.mock.writes().len(), 2);
     }
@@ -574,11 +571,9 @@ mod tests {
     #[tokio::test]
     async fn dry_run_only_logs_once() {
         let s = setup().await;
-        let mut cfg = load_config(&s.state.db, GUILD_ID).await.unwrap();
+        let mut cfg = load_config(&s.state.db, PID).await.unwrap();
         cfg.dry_run = true;
-        save_config(&s.state.db, GUILD_ID, &cfg, "root")
-            .await
-            .unwrap();
+        save_config(&s.state.db, PID, &cfg, "root").await.unwrap();
         add_rule(&s, |_| {}).await;
         s.mock.set_tasks(
             mock::LIST_ID,
@@ -586,21 +581,16 @@ mod tests {
         );
 
         for at in [NOW, NOW + 3600] {
-            let r = report(run(&s.state, GUILD_ID, at, true).await.unwrap());
+            let r = report(run(&s.state, PID, at, true).await.unwrap());
             assert_eq!((r.changed, r.dry_run), (1, true));
         }
         assert!(s.mock.writes().is_empty());
         assert!(s.mock.requests().iter().all(|r| r.method == "GET"));
-        let log = recent_log(&s.state.db, GUILD_ID, 10).await.unwrap();
+        let log = recent_log(&s.state.db, PID, 10).await.unwrap();
         assert_eq!(log.len(), 1, "the same occurrence is logged once");
         assert!(log[0].dry_run);
         assert_eq!(stat(&s, "moved").await, 0);
-        assert!(
-            done_markers(&s.state.db, GUILD_ID)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(done_markers(&s.state.db, PID).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -621,7 +611,7 @@ mod tests {
             vec![task, tagged("old", NOW - 61 * DAY, "to do", "open")],
         );
 
-        let r = report(run(&s.state, GUILD_ID, NOW, false).await.unwrap());
+        let r = report(run(&s.state, PID, NOW, false).await.unwrap());
         assert_eq!(r.changed, 1);
         let fetch = &s.mock.requests()[0];
         let lookback = (NOW - super::CREATE_LOOKBACK_SECS) * 1000 - 1;
@@ -660,12 +650,12 @@ mod tests {
             stored[0]["status"]["status"], "in progress",
             "the original stays"
         );
-        let markers = done_markers(&s.state.db, GUILD_ID).await.unwrap();
+        let markers = done_markers(&s.state.db, PID).await.unwrap();
         assert!(markers.contains(&("t1".to_owned(), (NOW - 3600) * 1000)));
         assert_eq!(stat(&s, "copied").await, 1);
 
         // The original is still overdue, but this occurrence was handled.
-        let r = report(run(&s.state, GUILD_ID, NOW + 600, true).await.unwrap());
+        let r = report(run(&s.state, PID, NOW + 600, true).await.unwrap());
         assert_eq!(r.changed, 0);
         assert_eq!(s.mock.writes().len(), 1);
     }
@@ -683,7 +673,7 @@ mod tests {
         let four = NOW - 5 * 3600;
         s.mock
             .set_tasks(mock::LIST_ID, vec![tagged("t1", four, "to do", "open")]);
-        report(run(&s.state, GUILD_ID, NOW, true).await.unwrap());
+        report(run(&s.state, PID, NOW, true).await.unwrap());
         let body = s.mock.writes()[0].json();
         assert_eq!(body["due_date"], json!((four + DAY) * 1000));
         assert_eq!(body["due_date_time"], json!(false));
@@ -694,9 +684,9 @@ mod tests {
         let s = setup().await;
         add_rule(&s, |_| {}).await;
         let db = &s.state.db;
-        set_last_run(db, GUILD_ID, NOW - 60).await.unwrap();
+        set_last_run(db, PID, NOW - 60).await.unwrap();
         assert_eq!(
-            run(&s.state, GUILD_ID, NOW, false).await.unwrap(),
+            run(&s.state, PID, NOW, false).await.unwrap(),
             Outcome::NotDue
         );
         assert!(
@@ -704,21 +694,15 @@ mod tests {
             "no ClickUp call before the interval"
         );
 
-        assert!(try_lock(db, GUILD_ID, NOW).await.unwrap());
-        assert_eq!(
-            run(&s.state, GUILD_ID, NOW, true).await.unwrap(),
-            Outcome::Busy
-        );
-        unlock(db, GUILD_ID).await.unwrap();
+        assert!(try_lock(db, PID, NOW).await.unwrap());
+        assert_eq!(run(&s.state, PID, NOW, true).await.unwrap(), Outcome::Busy);
+        unlock(db, PID).await.unwrap();
 
-        let r = report(run(&s.state, GUILD_ID, NOW + 15 * 60, false).await.unwrap());
+        let r = report(run(&s.state, PID, NOW + 15 * 60, false).await.unwrap());
         assert_eq!(r.changed, 0);
-        let cfg = load_config(db, GUILD_ID).await.unwrap();
+        let cfg = load_config(db, PID).await.unwrap();
         assert_eq!(cfg.last_run_at, Some(NOW + 15 * 60));
-        assert!(
-            try_lock(db, GUILD_ID, NOW + 15 * 60).await.unwrap(),
-            "released"
-        );
+        assert!(try_lock(db, PID, NOW + 15 * 60).await.unwrap(), "released");
     }
 
     #[tokio::test]
@@ -726,26 +710,22 @@ mod tests {
         let s = setup().await;
         let db = &s.state.db;
         assert_eq!(
-            run(&s.state, GUILD_ID, NOW, true).await.unwrap(),
+            run(&s.state, PID, NOW, true).await.unwrap(),
             Outcome::Problem(Problem::NoRules)
         );
         let mut rule = add_rule(&s, |_| {}).await;
 
-        set_enabled(db, GUILD_ID, tokens::SHARED, false)
-            .await
-            .unwrap();
+        set_enabled(db, PID, "clickup", false).await.unwrap();
         assert_eq!(
-            run(&s.state, GUILD_ID, NOW, true).await.unwrap(),
-            Outcome::Problem(Problem::Token(TokenProblem::SharedModuleDisabled))
+            run(&s.state, PID, NOW, true).await.unwrap(),
+            Outcome::Problem(Problem::Token(KeyProblem::SharedModuleDisabled))
         );
         assert!(s.mock.requests().is_empty());
-        set_enabled(db, GUILD_ID, tokens::SHARED, true)
-            .await
-            .unwrap();
+        set_enabled(db, PID, "clickup", true).await.unwrap();
 
         s.mock.fail_with(Some(429));
         assert_eq!(
-            run(&s.state, GUILD_ID, NOW, true).await.unwrap(),
+            run(&s.state, PID, NOW, true).await.unwrap(),
             Outcome::Problem(Problem::Api(ClickUpError::RateLimited))
         );
         s.mock.fail_with(None);
@@ -753,16 +733,16 @@ mod tests {
         assert_eq!(stat(&s, "api_err").await, 1);
 
         rule.enabled = false;
-        update_rule(db, GUILD_ID, &rule, "root").await.unwrap();
+        update_rule(db, PID, &rule, "root").await.unwrap();
         assert_eq!(
-            run(&s.state, GUILD_ID, NOW, true).await.unwrap(),
+            run(&s.state, PID, NOW, true).await.unwrap(),
             Outcome::Problem(Problem::NoRules)
         );
-        let mut cfg = load_config(db, GUILD_ID).await.unwrap();
+        let mut cfg = load_config(db, PID).await.unwrap();
         cfg.team_id = None;
-        save_config(db, GUILD_ID, &cfg, "root").await.unwrap();
+        save_config(db, PID, &cfg, "root").await.unwrap();
         assert_eq!(
-            run(&s.state, GUILD_ID, NOW, true).await.unwrap(),
+            run(&s.state, PID, NOW, true).await.unwrap(),
             Outcome::Problem(Problem::NoWorkspace)
         );
     }
@@ -777,10 +757,10 @@ mod tests {
         );
 
         for at in [NOW, NOW + 900] {
-            let r = report(run(&s.state, GUILD_ID, at, true).await.unwrap());
+            let r = report(run(&s.state, PID, at, true).await.unwrap());
             assert_eq!((r.changed, r.failed), (0, 1));
         }
-        let log = recent_log(&s.state.db, GUILD_ID, 10).await.unwrap();
+        let log = recent_log(&s.state.db, PID, 10).await.unwrap();
         assert_eq!(log.len(), 1);
         assert!(!log[0].success);
         let error = log[0].error.as_deref().unwrap();
@@ -788,12 +768,7 @@ mod tests {
         assert!(!error.contains(mock::TOKEN));
         assert_eq!(stat(&s, "failed").await, 1);
         assert_eq!(stat(&s, "moved").await, 0);
-        assert!(
-            done_markers(&s.state.db, GUILD_ID)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(done_markers(&s.state.db, PID).await.unwrap().is_empty());
         let stored = s.mock.tasks(mock::LIST_ID);
         assert_eq!(stored[0]["status"]["status"], "complete");
     }
@@ -810,20 +785,13 @@ mod tests {
             mock::LIST_ID,
             vec![tagged("t1", NOW - DAY, "complete", "closed")],
         );
-        let r = report(run(&s.state, GUILD_ID, NOW, true).await.unwrap());
+        let r = report(run(&s.state, PID, NOW, true).await.unwrap());
         assert_eq!(r.failed, 1);
-        assert!(
-            done_markers(&s.state.db, GUILD_ID)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(done_markers(&s.state.db, PID).await.unwrap().is_empty());
 
         rule.reopen_status.clear();
-        update_rule(&s.state.db, GUILD_ID, &rule, "root")
-            .await
-            .unwrap();
-        let r = report(run(&s.state, GUILD_ID, NOW + 60, true).await.unwrap());
+        update_rule(&s.state.db, PID, &rule, "root").await.unwrap();
+        let r = report(run(&s.state, PID, NOW + 60, true).await.unwrap());
         assert_eq!((r.changed, r.failed), (1, 0));
         let new_id: Option<String> = sqlx::query_scalar("SELECT new_task_id FROM recurring_done")
             .fetch_one(&s.state.db)
@@ -842,15 +810,15 @@ mod tests {
             vec![tagged("t1", NOW - DAY, "complete", "closed")],
         );
         s.mock.fail_writes_with(Some(502));
-        let r = report(run(&s.state, GUILD_ID, NOW, true).await.unwrap());
+        let r = report(run(&s.state, PID, NOW, true).await.unwrap());
         assert_eq!(r.failed, 1);
         s.mock.fail_writes_with(None);
 
         // ClickUp may have made the copy before failing, so it is not tried again.
-        let r = report(run(&s.state, GUILD_ID, NOW + 60, true).await.unwrap());
+        let r = report(run(&s.state, PID, NOW + 60, true).await.unwrap());
         assert_eq!((r.changed, r.failed), (0, 0));
         assert_eq!(s.mock.writes().len(), 1);
-        let log = recent_log(&s.state.db, GUILD_ID, 10).await.unwrap();
+        let log = recent_log(&s.state.db, PID, 10).await.unwrap();
         assert_eq!(log.len(), 1);
         assert!(!log[0].success);
     }
@@ -866,18 +834,18 @@ mod tests {
                 tagged("t2", NOW - DAY, "to do", "open"),
             ],
         );
-        let (plan, truncated) = preview(&s.state, GUILD_ID, NOW).await.unwrap().unwrap();
+        let (plan, truncated) = preview(&s.state, PID, NOW).await.unwrap().unwrap();
         assert!(!truncated);
         let ids: Vec<&str> = plan.items.iter().map(|p| p.task.id.as_str()).collect();
         assert_eq!(ids, ["t1"]);
         // Cached: a second preview reads nothing.
         let reads = s.mock.requests().len();
-        preview(&s.state, GUILD_ID, NOW).await.unwrap().unwrap();
+        preview(&s.state, PID, NOW).await.unwrap().unwrap();
         assert_eq!(s.mock.requests().len(), reads);
         assert!(s.mock.writes().is_empty());
 
-        report(run(&s.state, GUILD_ID, NOW, true).await.unwrap());
-        let (plan, _) = preview(&s.state, GUILD_ID, NOW).await.unwrap().unwrap();
+        report(run(&s.state, PID, NOW, true).await.unwrap());
+        let (plan, _) = preview(&s.state, PID, NOW).await.unwrap().unwrap();
         assert!(plan.items.is_empty(), "the run refreshed the preview");
     }
 }

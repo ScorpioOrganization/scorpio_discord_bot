@@ -1,0 +1,110 @@
+{# Key cards. Needs `keys: Vec<KeyView>` and `page` in the including page. #}
+{% for key in keys %}
+<section class="card">
+  <h2>{{ key.title() }}</h2>
+
+  {% if key.shared_option %}
+  <form class="form" method="post" action="{{ key.action }}/source">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label class="check">
+      <input type="radio" name="source" value="shared"{% if key.use_shared %} checked{% endif %}>
+      <span>Use the shared {{ key.key_name }} from the <a href="{{ key.shared_path }}">{{ key.service }} module</a></span>
+    </label>
+    <label class="check">
+      <input type="radio" name="source" value="own"{% if !key.use_shared %} checked{% endif %}>
+      <span>Use a separate {{ key.key_name }} for this module</span>
+    </label>
+    <div class="actions"><button class="btn btn-secondary" type="submit">Save choice</button></div>
+  </form>
+  {% if key.use_shared %}
+  {% if let Some(s) = key.shared %}
+  <p class="hint">Shared {{ key.key_name }} of {% if s.account.is_empty() %}an account not seen yet{% else %}<strong>{{ s.account }}</strong>{% endif %}, ending in <code>{{ s.hint }}</code>.</p>
+  {% endif %}
+  {% if let Some(note) = key.write_note %}
+  <p class="hint">{{ note }}</p>
+  {% endif %}
+  {% endif %}
+  {% endif %}
+
+  {% if let Some(problem) = key.problem %}
+  <div class="callout callout-warn small">{{ problem }}</div>
+  {% endif %}
+
+  {% if let Some(server) = key.server %}
+  {% if server.editable %}
+  {% if key.own.is_some() %}
+  <form class="form" method="post" action="{{ key.action }}/server">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>
+      <span>Discord server</span>
+      <select name="guild_id" required>
+        {% if server.selected_id == 0 %}<option value="">Pick a server</option>{% endif %}
+        {% if server.selected_elsewhere() %}
+        <option value="{{ server.selected_id }}" selected>{{ server.selected_name }} (bot is not a member)</option>
+        {% endif %}
+        {% for o in server.options %}
+        <option value="{{ o.id }}"{% if o.selected %} selected{% endif %}>{{ o.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% if let Some(err) = server.error %}
+    <p class="hint">Could not load the bot's servers: {{ err }}</p>
+    {% else %}
+    <p class="hint">Servers the bot is a member of. Invite it with the OAuth2 URL generator of your application to add one.</p>
+    {% endif %}
+    <div class="actions"><button class="btn btn-secondary" type="submit">Save server</button></div>
+  </form>
+  {% endif %}
+  {% else if server.selected_id != 0 %}
+  <p class="hint">Works in the Discord server <strong>{{ server.selected_name }}</strong>, set in the <a href="{{ key.shared_path }}">Discord module</a>.</p>
+  {% endif %}
+  {% if !server.also_used_by.is_empty() %}
+  <p class="hint">Other projects use this server too: {{ server.also_used_by.join(", ") }}. Modules enabled in several of them act more than once, for example greeting a new member twice.</p>
+  {% endif %}
+  {% endif %}
+
+  {% if !key.use_shared %}
+  {% if let Some(k) = key.own %}
+  <dl class="kv key-status">
+    <div><dt>{% if key.server.is_some() %}Bot{% else %}{{ key.service }} account{% endif %}</dt><dd>{% if k.account.is_empty() %}Not seen yet{% else %}{{ k.account }}{% endif %}</dd></div>
+    <div><dt>Ending in</dt><dd><code>{{ k.hint }}</code>{% if !k.readable %} <span class="badge badge-err">cannot be decrypted</span>{% endif %}</dd></div>
+    <div><dt>Saved</dt><dd><time data-ts="{{ k.updated_at }}">{{ k.updated() }}</time>{% if !k.updated_by.is_empty() %} by {{ k.updated_by }}{% endif %}</dd></div>
+    {% if key.server.is_none() %}
+    <div><dt>Last successful use</dt><dd>{% if k.last_ok_at.is_some() %}<time data-ts="{{ k.last_ok_ts() }}">{{ k.last_ok() }}</time>{% else %}Never{% endif %}</dd></div>
+    {% endif %}
+  </dl>
+  {% if let Some(err) = k.current_error() %}
+  <div class="callout callout-err small"><strong>Last error</strong> (<time data-ts="{{ k.last_error_ts() }}">{{ k.last_error_time() }}</time>): {{ err }}</div>
+  {% endif %}
+  {% else %}
+  <p class="muted">No {{ key.key_name }} saved yet.</p>
+  {% endif %}
+
+  <form class="form" method="post" action="{{ key.action }}">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>
+      <span>{% if key.own.is_some() %}Replace {{ key.key_name }}{% else %}{{ key.service }} {{ key.key_name }}{% endif %}</span>
+      <input type="password" name="token" autocomplete="off" spellcheck="false" placeholder="{{ key.placeholder }}" maxlength="200" required>
+    </label>
+    <p class="hint">{{ key.help }} {% if let Some(note) = key.write_note %}{{ note }}{% else %}{% if key.server.is_none() %}The bot only reads from {{ key.service }} with this key, it never changes anything there.{% endif %}{% endif %}</p>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit">Save {{ key.key_name }}</button>
+    </div>
+  </form>
+  {% if key.own.is_some() %}
+  <div class="actions">
+    {% if key.server.is_some() %}
+    <form method="post" action="{{ key.action }}/reconnect">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-secondary btn-sm" type="submit">Reconnect bot</button>
+    </form>
+    {% endif %}
+    <form method="post" action="{{ key.action }}/delete" data-confirm="Remove the saved {{ key.service }} {{ key.key_name }}?">
+      <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+      <button class="btn btn-danger btn-sm" type="submit">Remove {{ key.key_name }}</button>
+    </form>
+  </div>
+  {% endif %}
+  {% endif %}
+</section>
+{% endfor %}

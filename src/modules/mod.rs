@@ -1,5 +1,6 @@
 pub mod calendar;
 pub mod clickup;
+pub mod discord;
 pub mod greeting;
 pub mod recurring;
 pub mod text;
@@ -10,15 +11,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::Router;
 use serenity::all::{Context, GatewayIntents, Member};
-use sqlx::SqlitePool;
+use sqlx::{SqliteExecutor, SqlitePool};
 
-use crate::db::sf;
-use crate::state::{AppState, DiscordHandle};
+use crate::keys::Service;
+use crate::state::AppState;
 
-/// A bot feature that can be switched on or off per guild from the dashboard.
+/// A feature that can be switched on or off per project from the dashboard.
 ///
 /// Adding a module: implement this trait in a new folder under `src/modules`, then add it
-/// to [`registry`]. The bot handler and the dashboard pick it up automatically.
+/// to [`registry`]. The bot handler, the scheduler and the dashboard pick it up
+/// automatically.
 #[async_trait]
 pub trait Module: Send + Sync + 'static {
     /// Stable identifier used in URLs and the database.
@@ -26,21 +28,30 @@ pub trait Module: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
 
-    /// A few key numbers shown on the module card of the guild page.
-    async fn summary(&self, state: &AppState, guild_id: u64) -> Result<Vec<StatItem>>;
+    /// Services the module needs a key for. Each gets a key card (shared key or the module's
+    /// own) and is listed on the project page. Modules using Discord get its events and keep
+    /// their bot connected while enabled.
+    fn services(&self) -> &'static [Service] {
+        &[]
+    }
 
-    /// Dashboard routes. Paths must start with `/guilds/{gid}/modules/<id>`.
+    /// A few key numbers shown on the module card of the project page.
+    async fn summary(&self, state: &AppState, project_id: i64) -> Result<Vec<StatItem>>;
+
+    /// Dashboard routes. Paths must start with `/projects/{pid}/modules/<id>`.
     fn routes(&self) -> Router<AppState>;
 
-    /// Gateway intents the module's event hooks rely on, on top of `GUILDS`.
+    /// Discord gateway intents the module's event hooks rely on, on top of `GUILDS`.
     fn intents(&self) -> GatewayIntents {
         GatewayIntents::empty()
     }
 
+    /// Someone joined the Discord server this module's bot works in.
     async fn on_member_join(
         &self,
         _ctx: &Context,
         _state: &AppState,
+        _project_id: i64,
         _member: &Member,
     ) -> Result<()> {
         Ok(())
@@ -51,14 +62,9 @@ pub trait Module: Send + Sync + 'static {
         false
     }
 
-    /// Periodic work, called by `bot::scheduler` about once a minute for every guild the
-    /// module is enabled in, while the bot is connected.
-    async fn on_tick(
-        &self,
-        _state: &AppState,
-        _discord: &DiscordHandle,
-        _guild_id: u64,
-    ) -> Result<()> {
+    /// Periodic work, called by the scheduler about once a minute for every project the
+    /// module is enabled in.
+    async fn on_tick(&self, _state: &AppState, _project_id: i64) -> Result<()> {
         Ok(())
     }
 }
@@ -79,18 +85,19 @@ impl StatItem {
 
 pub fn registry() -> Vec<Arc<dyn Module>> {
     vec![
-        Arc::new(greeting::GreetingModule),
+        Arc::new(discord::DiscordModule),
         Arc::new(clickup::ClickUpModule),
+        Arc::new(greeting::GreetingModule),
         Arc::new(calendar::CalendarModule),
         Arc::new(recurring::RecurringModule),
     ]
 }
 
-pub async fn is_enabled(db: &SqlitePool, guild_id: u64, module_id: &str) -> Result<bool> {
+pub async fn is_enabled(db: &SqlitePool, project_id: i64, module_id: &str) -> Result<bool> {
     let enabled: Option<bool> = sqlx::query_scalar(
-        "SELECT enabled FROM guild_modules WHERE guild_id = ? AND module_id = ?",
+        "SELECT enabled FROM project_modules WHERE project_id = ? AND module_id = ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(module_id.to_owned())
     .fetch_optional(db)
     .await?;
@@ -98,16 +105,16 @@ pub async fn is_enabled(db: &SqlitePool, guild_id: u64, module_id: &str) -> Resu
 }
 
 pub async fn set_enabled(
-    db: &SqlitePool,
-    guild_id: u64,
+    db: impl SqliteExecutor<'_>,
+    project_id: i64,
     module_id: &str,
     enabled: bool,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO guild_modules (guild_id, module_id, enabled) VALUES (?, ?, ?)
-         ON CONFLICT (guild_id, module_id) DO UPDATE SET enabled = excluded.enabled",
+        "INSERT INTO project_modules (project_id, module_id, enabled) VALUES (?, ?, ?)
+         ON CONFLICT (project_id, module_id) DO UPDATE SET enabled = excluded.enabled",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(module_id.to_owned())
     .bind(enabled)
     .execute(db)
@@ -115,38 +122,38 @@ pub async fn set_enabled(
     Ok(())
 }
 
-/// Guilds a module is switched on in, whether or not the bot is still a member.
-pub async fn enabled_guilds(db: &SqlitePool, module_id: &str) -> Result<Vec<u64>> {
-    let ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT guild_id FROM guild_modules WHERE module_id = ? AND enabled = 1 ORDER BY guild_id",
+/// Projects a module is switched on in.
+pub async fn enabled_projects(db: &SqlitePool, module_id: &str) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT m.project_id FROM project_modules m JOIN projects p ON p.id = m.project_id
+         WHERE m.module_id = ? AND m.enabled = 1 ORDER BY m.project_id",
     )
     .bind(module_id.to_owned())
     .fetch_all(db)
-    .await?;
-    Ok(ids.into_iter().map(|id| id as u64).collect())
+    .await?)
 }
 
-pub async fn enabled_count(db: &SqlitePool, guild_id: u64) -> Result<i64> {
-    Ok(
-        sqlx::query_scalar("SELECT COUNT(*) FROM guild_modules WHERE guild_id = ? AND enabled = 1")
-            .bind(sf(guild_id))
-            .fetch_one(db)
-            .await?,
+pub async fn enabled_count(db: &SqlitePool, project_id: i64) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_modules WHERE project_id = ? AND enabled = 1",
     )
+    .bind(project_id)
+    .fetch_one(db)
+    .await?)
 }
 
-/// Increments an all-time counter for a module in a guild.
+/// Increments an all-time counter for a module in a project.
 pub async fn bump_counter(
     db: &SqlitePool,
-    guild_id: u64,
+    project_id: i64,
     module_id: &str,
     key: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO module_stats (guild_id, module_id, key, value) VALUES (?, ?, ?, 1)
-         ON CONFLICT (guild_id, module_id, key) DO UPDATE SET value = value + 1",
+        "INSERT INTO module_stats (project_id, module_id, key, value) VALUES (?, ?, ?, 1)
+         ON CONFLICT (project_id, module_id, key) DO UPDATE SET value = value + 1",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(module_id.to_owned())
     .bind(key.to_owned())
     .execute(db)
@@ -154,19 +161,19 @@ pub async fn bump_counter(
     Ok(())
 }
 
-/// Reads a counter for one guild, or the sum over all guilds when `guild_id` is None.
+/// Reads a counter for one project, or the sum over all projects when `project_id` is None.
 pub async fn counter(
     db: &SqlitePool,
-    guild_id: Option<u64>,
+    project_id: Option<i64>,
     module_id: &str,
     key: &str,
 ) -> Result<i64> {
     let value: Option<i64> =
-        match guild_id {
-            Some(gid) => sqlx::query_scalar(
-                "SELECT value FROM module_stats WHERE guild_id = ? AND module_id = ? AND key = ?",
+        match project_id {
+            Some(pid) => sqlx::query_scalar(
+                "SELECT value FROM module_stats WHERE project_id = ? AND module_id = ? AND key = ?",
             )
-            .bind(sf(gid))
+            .bind(pid)
             .bind(module_id.to_owned())
             .bind(key.to_owned())
             .fetch_optional(db)
@@ -187,32 +194,43 @@ pub async fn counter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects;
     use crate::test_util;
 
     #[tokio::test]
-    async fn modules_off_by_default_and_toggle_per_guild() {
+    async fn modules_off_by_default_and_toggle_per_project() {
         let db = test_util::pool().await;
-        assert!(!is_enabled(&db, 1, "greeting").await.unwrap());
-        assert_eq!(enabled_count(&db, 1).await.unwrap(), 0);
+        let [a, b, c] = test_util::projects(&db, ["A", "B", "C"]).await;
+        assert!(!is_enabled(&db, a, "greeting").await.unwrap());
+        assert_eq!(enabled_count(&db, a).await.unwrap(), 0);
 
-        set_enabled(&db, 1, "greeting", true).await.unwrap();
-        set_enabled(&db, 1, "other", true).await.unwrap();
-        assert!(is_enabled(&db, 1, "greeting").await.unwrap());
-        assert!(!is_enabled(&db, 2, "greeting").await.unwrap());
-        assert_eq!(enabled_count(&db, 1).await.unwrap(), 2);
+        set_enabled(&db, a, "greeting", true).await.unwrap();
+        set_enabled(&db, a, "other", true).await.unwrap();
+        assert!(is_enabled(&db, a, "greeting").await.unwrap());
+        assert!(!is_enabled(&db, b, "greeting").await.unwrap());
+        assert_eq!(enabled_count(&db, a).await.unwrap(), 2);
 
-        set_enabled(&db, 3, "greeting", true).await.unwrap();
-        assert_eq!(enabled_guilds(&db, "greeting").await.unwrap(), [1, 3]);
+        set_enabled(&db, c, "greeting", true).await.unwrap();
+        assert_eq!(enabled_projects(&db, "greeting").await.unwrap(), [a, c]);
 
-        set_enabled(&db, 1, "greeting", false).await.unwrap();
-        assert!(!is_enabled(&db, 1, "greeting").await.unwrap());
-        assert_eq!(enabled_count(&db, 1).await.unwrap(), 1);
-        assert_eq!(enabled_guilds(&db, "greeting").await.unwrap(), [3]);
-        assert_eq!(enabled_guilds(&db, "other").await.unwrap(), [1]);
+        set_enabled(&db, a, "greeting", false).await.unwrap();
+        assert!(!is_enabled(&db, a, "greeting").await.unwrap());
+        assert_eq!(enabled_count(&db, a).await.unwrap(), 1);
+        assert_eq!(enabled_projects(&db, "greeting").await.unwrap(), [c]);
+        assert_eq!(enabled_projects(&db, "other").await.unwrap(), [a]);
+
+        // Rows of a deleted project are never listed.
+        sqlx::query("DELETE FROM projects WHERE id = ?")
+            .bind(c)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(enabled_projects(&db, "greeting").await.unwrap().is_empty());
+        assert!(projects::get(&db, c).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn counters_per_guild_and_total() {
+    async fn counters_per_project_and_total() {
         let db = test_util::pool().await;
         assert_eq!(counter(&db, Some(1), "m", "sent").await.unwrap(), 0);
         assert_eq!(counter(&db, None, "m", "sent").await.unwrap(), 0);
@@ -230,18 +248,15 @@ mod tests {
         assert_eq!(counter(&db, None, "m", "failed").await.unwrap(), 1);
     }
 
-    #[tokio::test]
-    async fn snowflakes_above_i64_max_round_trip() {
-        let db = test_util::pool().await;
-        let gid = u64::MAX - 5;
-        set_enabled(&db, gid, "greeting", true).await.unwrap();
-        bump_counter(&db, gid, "greeting", "sent").await.unwrap();
-        assert!(is_enabled(&db, gid, "greeting").await.unwrap());
-        assert!(!is_enabled(&db, gid - 1, "greeting").await.unwrap());
-        assert_eq!(enabled_guilds(&db, "greeting").await.unwrap(), [gid]);
-        assert_eq!(
-            counter(&db, Some(gid), "greeting", "sent").await.unwrap(),
-            1
-        );
+    #[test]
+    fn module_ids_are_unique_and_services_have_their_module() {
+        let modules = registry();
+        let mut ids: Vec<_> = modules.iter().map(|m| m.id()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), modules.len());
+        for service in [Service::ClickUp, Service::Discord] {
+            assert!(ids.contains(&service.shared_owner()));
+        }
     }
 }

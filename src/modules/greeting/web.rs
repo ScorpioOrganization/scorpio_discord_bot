@@ -12,27 +12,25 @@ use super::{
     send,
 };
 use crate::auth::extract::CurrentUser;
-use crate::bot::info::{self, ChannelOption, GuildSummary};
+use crate::discord::connection::connection;
+use crate::discord::info::{ChannelOption, channel_choices};
 use crate::error::{AppError, AppResult};
+use crate::keys::Service;
+use crate::keys::web::{KeyView, key_routes, key_view};
 use crate::modules::{self, text};
+use crate::projects::Project;
 use crate::state::AppState;
-use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_guild};
+use crate::web::{MsgQuery, PageCtx, fmt_ts, redirect_msg, require_project};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/guilds/{gid}/modules/greeting", get(page).post(save))
-        .route("/guilds/{gid}/modules/greeting/test", post(send_test))
+        .route("/projects/{pid}/modules/greeting", get(page).post(save))
+        .route("/projects/{pid}/modules/greeting/test", post(send_test))
+        .merge(key_routes(Service::Discord, ID))
 }
 
-fn base_path(gid: u64) -> String {
-    format!("/guilds/{gid}/modules/{ID}")
-}
-
-fn channels(state: &AppState, gid: u64) -> Vec<ChannelOption> {
-    state
-        .discord()
-        .map(|d| info::text_channels(&d.cache, gid))
-        .unwrap_or_default()
+fn base_path(pid: i64) -> String {
+    format!("/projects/{pid}/modules/{ID}")
 }
 
 impl LogRow {
@@ -53,8 +51,12 @@ impl LogRow {
 #[template(path = "modules/greeting.html")]
 struct GreetingPage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
     enabled: bool,
+    keys: Vec<KeyView>,
+    /// Name and member count of the Discord server, for the preview.
+    server_name: String,
+    member_count: u64,
     channels: Vec<ChannelOption>,
     template: String,
     use_embed: bool,
@@ -70,55 +72,59 @@ struct GreetingPage {
 async fn page(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(&state, gid)?;
-    let cfg = load_config(&state.db, gid).await?;
-    let enabled = modules::is_enabled(&state.db, gid, ID).await?;
+    let project = require_project(&state, pid).await?;
+    let cfg = load_config(&state.db, pid).await?;
+    let enabled = modules::is_enabled(&state.db, pid, ID).await?;
+    let conn = connection(&state, pid, ID).await?.ok();
 
-    let mut channels = channels(&state, gid);
     let selected = cfg.channel_id.map(|c| c as u64);
-    for c in &mut channels {
-        c.selected = Some(c.id) == selected;
-    }
+    let channels = channel_choices(conn.as_ref(), selected);
 
     let mut warnings = Vec::new();
-    if !state
-        .missing_intents(GatewayIntents::GUILD_MEMBERS)
-        .is_empty()
-    {
-        warnings.push(
-            "Server Members Intent is disabled in the Discord developer portal, so the bot does not \
-             see members joining and no greetings are sent. Enable it on the Bot tab of your \
-             application and restart the bot.",
-        );
-    }
-    match channels.iter().find(|c| c.selected) {
-        None if selected.is_some() => {
-            warnings.push("The configured channel no longer exists. Pick a new one.")
+    if let Some(conn) = &conn {
+        if !conn.handle.intents.contains(GatewayIntents::GUILD_MEMBERS) {
+            warnings.push(
+                "Server Members Intent is disabled in the Discord developer portal, so the bot \
+                 does not see members joining and no greetings are sent. Enable it on the Bot \
+                 tab of your application and reconnect the bot.",
+            );
         }
-        None => {
-            warnings.push("No channel selected yet. Greetings are not sent until you pick one.")
+        match channels.iter().find(|c| c.selected) {
+            None if selected.is_some() => {
+                warnings.push("The configured channel no longer exists. Pick a new one.")
+            }
+            None => {
+                warnings.push("No channel selected yet. Greetings are not sent until you pick one.")
+            }
+            Some(c) if !c.can_send => {
+                warnings.push("The bot cannot view or send messages in the selected channel.")
+            }
+            Some(c) if cfg.use_embed && !c.can_embed => warnings
+                .push("Embed mode is on but the bot lacks the Embed Links permission there."),
+            Some(_) => {}
         }
-        Some(c) if !c.can_send => {
-            warnings.push("The bot cannot view or send messages in the selected channel.")
-        }
-        Some(c) if cfg.use_embed && !c.can_embed => {
-            warnings.push("Embed mode is on but the bot lacks the Embed Links permission there.")
-        }
-        Some(_) => {}
     }
 
-    let bot_name = state
-        .discord()
-        .map(|d| d.cache.current_user().name.clone())
+    let guild = conn.as_ref().and_then(|c| c.guild());
+    let bot_name = conn
+        .as_ref()
+        .map(|c| c.handle.cache.current_user().name.clone())
+        .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Scorpio".into());
 
     let page = GreetingPage {
-        page: PageCtx::new(&user, "guilds", &msg),
-        guild,
+        page: PageCtx::new(&user, "projects", &msg),
+        project,
         enabled,
+        keys: vec![key_view(&state, pid, Service::Discord, ID).await?],
+        server_name: guild
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| "your server".into()),
+        member_count: guild.as_ref().map(|g| g.member_count).unwrap_or_default(),
         channels,
         template: cfg.template,
         use_embed: cfg.use_embed,
@@ -127,7 +133,7 @@ async fn page(
         placeholders: PLACEHOLDERS,
         max_len: MAX_TEMPLATE_LEN,
         warnings,
-        stats: load_stats(&state.db, gid).await?,
+        stats: load_stats(&state.db, pid).await?,
         bot_name,
     };
     Ok(Html(page.render()?))
@@ -145,17 +151,25 @@ struct SaveForm {
 async fn save(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Form(form): Form<SaveForm>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
-    let back = base_path(gid);
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
+    let saved = load_config(&state.db, pid)
+        .await?
+        .channel_id
+        .map(|c| c as u64);
 
     let channel_id = match form.channel_id.trim() {
         "" => None,
         raw => {
             let id: u64 = raw.parse().map_err(|_| AppError::BadRequest)?;
-            if !channels(&state, gid).iter().any(|c| c.id == id) {
+            let conn = connection(&state, pid, ID).await?.ok();
+            if !channel_choices(conn.as_ref(), saved)
+                .iter()
+                .any(|c| c.id == id)
+            {
                 return Ok(redirect_msg(&back, "invalid_channel"));
             }
             Some(id as i64)
@@ -182,8 +196,8 @@ async fn save(
         embed_color: i64::from(embed_color),
         greet_bots: form.greet_bots.is_some(),
     };
-    save_config(&state.db, gid, &cfg, &user.username).await?;
-    tracing::info!(user = %user.username, guild_id = gid, "greeting settings saved");
+    save_config(&state.db, pid, &cfg, &user.username).await?;
+    tracing::info!(user = %user.username, project_id = pid, "greeting settings saved");
     Ok(redirect_msg(&back, "saved"))
 }
 
@@ -191,20 +205,21 @@ async fn save(
 async fn send_test(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
 ) -> AppResult<Response> {
-    let guild = require_guild(&state, gid)?;
-    let back = base_path(gid);
-    let Some(discord) = state.discord() else {
+    require_project(&state, pid).await?;
+    let back = base_path(pid);
+    let Ok(conn) = connection(&state, pid, ID).await? else {
         return Ok(redirect_msg(&back, "bot_offline"));
     };
-    let cfg = load_config(&state.db, gid).await?;
+    let cfg = load_config(&state.db, pid).await?;
     let Some(channel_id) = cfg.channel_id else {
         return Ok(redirect_msg(&back, "no_channel"));
     };
+    let guild = conn.guild().ok_or(AppError::NotFound)?;
 
     let (vars, avatar) = {
-        let me = discord.cache.current_user();
+        let me = conn.handle.cache.current_user();
         let vars = Vars {
             user_id: me.id.get(),
             username: me.name.clone(),
@@ -215,9 +230,17 @@ async fn send_test(
         (vars, me.face())
     };
 
-    let result = send(&discord.http, &cfg, channel_id as u64, &vars, None, avatar).await;
-    log_attempt(&state.db, gid, &vars, &result, true).await?;
-    tracing::info!(user = %user.username, guild_id = gid, ok = result.is_ok(), "greeting test sent");
+    let result = send(
+        &conn.handle.http,
+        &cfg,
+        channel_id as u64,
+        &vars,
+        None,
+        avatar,
+    )
+    .await;
+    log_attempt(&state.db, pid, &vars, &result, true).await?;
+    tracing::info!(user = %user.username, project_id = pid, ok = result.is_ok(), "greeting test sent");
     Ok(redirect_msg(
         &back,
         if result.is_ok() {

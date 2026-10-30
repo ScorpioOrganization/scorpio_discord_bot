@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }}{% endblock %}
+{% block content %}
+<nav class="crumbs"><a href="/">Overview</a><span>/</span><span>{{ project.name }}</span></nav>
+
+<header class="page-head">
+  <div class="guild-head">
+    {% if let Some(server) = server %}
+    {% if let Some(icon) = server.icon %}
+    <img class="guild-icon" src="{{ icon }}" alt="">
+    {% else %}
+    <span class="guild-icon guild-initials">{{ server.initials() }}</span>
+    {% endif %}
+    {% endif %}
+    <div>
+      <h1>{{ project.name }}</h1>
+      {% if let Some(server) = server %}
+      <p class="muted">Discord server {{ server.name }}, {{ server.member_count }} members</p>
+      {% else %}
+      <p class="muted">Enable modules and give them the keys of the services they use.</p>
+      {% endif %}
+    </div>
+  </div>
+</header>
+
+<h2 class="section-title">Modules</h2>
+<div class="module-grid">
+  {% for m in modules %}
+  <article class="card module-card">
+    <div class="module-head">
+      <div>
+        <h3>{{ m.name }}</h3>
+        <p class="muted small">{{ m.description }}</p>
+      </div>
+      {% if m.enabled %}
+      <span class="badge badge-on">Enabled</span>
+      {% else %}
+      <span class="badge badge-off">Disabled</span>
+      {% endif %}
+    </div>
+    {% if !m.uses.is_empty() %}
+    <p class="muted small">Uses {{ m.uses.join(", ") }}</p>
+    {% endif %}
+    {% for problem in m.problems %}
+    <p class="callout callout-warn small">{{ problem }}</p>
+    {% endfor %}
+    {% if !m.missing_intents.is_empty() %}
+    <p class="callout callout-warn small">Needs {{ m.missing_intents.join(", ") }}, which is disabled in the Discord developer portal. This module does nothing until it is enabled.</p>
+    {% endif %}
+    <dl class="kv">
+      {% for s in m.stats %}
+      <div><dt>{{ s.label }}</dt><dd>{{ s.value }}</dd></div>
+      {% endfor %}
+    </dl>
+    <div class="actions">
+      <a class="btn btn-secondary" href="/projects/{{ project.id }}/modules/{{ m.id }}">Configure</a>
+      <form method="post" action="/projects/{{ project.id }}/modules/{{ m.id }}/toggle">
+        <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+        {% if m.enabled %}
+        <input type="hidden" name="enabled" value="0">
+        <button class="btn btn-ghost" type="submit">Disable</button>
+        {% else %}
+        <input type="hidden" name="enabled" value="1">
+        <button class="btn btn-primary" type="submit">Enable</button>
+        {% endif %}
+      </form>
+    </div>
+  </article>
+  {% endfor %}
+</div>
+
+<h2 class="section-title">Project</h2>
+<section class="card">
+  <form class="form" method="post" action="/projects/{{ project.id }}/rename">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <label>
+      <span>Name</span>
+      <input type="text" name="name" value="{{ project.name }}" maxlength="{{ max_name }}" required>
+    </label>
+    <div class="actions"><button class="btn btn-secondary" type="submit">Rename</button></div>
+  </form>
+  {% if page.is_root %}
+  <form method="post" action="/projects/{{ project.id }}/delete" class="actions" data-confirm="Delete this project with all its settings, keys and statistics? This cannot be undone.">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <button class="btn btn-danger btn-sm" type="submit">Delete project</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}
