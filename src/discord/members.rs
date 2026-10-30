@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use serenity::all::{Cache, GuildId, Http, Member};
 
+use super::connection::Conn;
 use crate::state::AppState;
 
 /// How long a fetched member list is reused.
@@ -79,23 +80,25 @@ impl MemberCache {
     }
 }
 
-/// Human members of a guild. Fetched over HTTP (needs the Server Members Intent) and cached;
-/// when that fails the members in the gateway cache are used. Empty without a bot.
-pub async fn guild_members(state: &AppState, guild_id: u64) -> Arc<Vec<MemberInfo>> {
+/// Human members of the server of a connection. Fetched over HTTP (needs the Server Members
+/// Intent) and cached; when that fails the members in the gateway cache are used. Empty
+/// without a connection.
+pub async fn guild_members(state: &AppState, conn: Option<&Conn>) -> Arc<Vec<MemberInfo>> {
+    let Some(conn) = conn else {
+        return Arc::default();
+    };
+    let guild_id = conn.guild_id;
     if let Some(members) = state.members.get(guild_id) {
         return members;
     }
-    let Some(discord) = state.discord() else {
-        return Arc::default();
-    };
-    let members = match fetch(&discord.http, guild_id).await {
+    let members = match fetch(&conn.handle.http, guild_id).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
                 guild_id,
                 "could not list members, using the gateway cache: {e}"
             );
-            from_cache(&discord.cache, guild_id)
+            from_cache(&conn.handle.cache, guild_id)
         }
     };
     state.members.insert(guild_id, members)
@@ -173,16 +176,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn members_come_from_the_cache_without_http() {
+    async fn members_of_the_connection_server() {
         let state = crate::test_util::state().await;
-        assert!(
-            guild_members(&state, crate::test_util::GUILD_ID)
-                .await
-                .is_empty()
-        );
+        assert!(guild_members(&state, None).await.is_empty());
 
-        crate::test_util::connect_fake_discord(&state);
-        let members = guild_members(&state, crate::test_util::GUILD_ID).await;
+        let pid = crate::projects::create(&state.db, "A", "root")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::test_util::connect_fake_discord(&state, pid).await;
+        let conn = crate::discord::connection::connection(&state, pid, "discord")
+            .await
+            .unwrap()
+            .unwrap();
+        let members = guild_members(&state, Some(&conn)).await;
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].display(), "Anna Nowak");
     }

@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% block title %}Greeting | {{ guild.name }}{% endblock %}
+{% block title %}Greeting | {{ project.name }}{% endblock %}
 {% block content %}
 <nav class="crumbs">
   <a href="/">Overview</a><span>/</span>
-  <a href="/guilds/{{ guild.id }}">{{ guild.name }}</a><span>/</span>
+  <a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span>
   <span>Greeting</span>
 </nav>
 
@@ -12,7 +12,7 @@
     <h1>Greeting</h1>
     <p class="muted">Welcome new members with a message in a channel of your choice.</p>
   </div>
-  <form method="post" action="/guilds/{{ guild.id }}/modules/greeting/toggle" class="toggle-form">
+  <form method="post" action="/projects/{{ project.id }}/modules/greeting/toggle" class="toggle-form">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">
     <input type="hidden" name="back" value="module">
     {% if enabled %}
@@ -32,7 +32,7 @@
 {% endfor %}
 
 <div class="two-col">
-  <form class="card form" method="post" action="/guilds/{{ guild.id }}/modules/greeting" id="greeting-form">
+  <form class="card form" method="post" action="/projects/{{ project.id }}/modules/greeting" id="greeting-form">
     <input type="hidden" name="_csrf" value="{{ page.csrf }}">
     <h2>Settings</h2>
 
@@ -80,7 +80,7 @@
   <div class="stack">
     <section class="card">
       <h2>Preview</h2>
-      <div class="dp" id="preview" data-server="{{ guild.name }}" data-count="{{ guild.member_count }}">
+      <div class="dp" id="preview" data-server="{{ server_name }}" data-count="{{ member_count }}">
         <span class="dp-avatar"></span>
         <div class="dp-body">
           <div class="dp-head"><span class="dp-name">{{ bot_name }}</span><span class="dp-tag">APP</span></div>
@@ -91,7 +91,7 @@
         </div>
       </div>
       <p class="hint">Live preview of unsaved changes, using a sample member called NewMember.</p>
-      <form method="post" action="/guilds/{{ guild.id }}/modules/greeting/test" class="actions">
+      <form method="post" action="/projects/{{ project.id }}/modules/greeting/test" class="actions">
         <input type="hidden" name="_csrf" value="{{ page.csrf }}">
         <button class="btn btn-secondary" type="submit">Send test message</button>
       </form>
@@ -109,6 +109,13 @@
       </table>
       <p class="hint">Text such as <code>**bold**</code> uses normal Discord formatting. Only the new member can be pinged, <code>@everyone</code> and role mentions are always blocked.</p>
     </section>
+  </div>
+</div>
+
+<h2 class="section-title">Discord</h2>
+<div class="two-col">
+  <div class="stack">
+    {% include "keys/cards.html" %}
   </div>
 </div>
 

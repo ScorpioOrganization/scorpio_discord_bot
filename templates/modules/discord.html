@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Discord | {{ project.name }}{% endblock %}
+{% block content %}
+<nav class="crumbs">
+  <a href="/">Overview</a><span>/</span>
+  <a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span>
+  <span>Discord</span>
+</nav>
+
+<header class="page-head">
+  <div>
+    <h1>Discord</h1>
+    <p class="muted">The bot other modules of this project can share, and the server it works in.</p>
+  </div>
+  <form method="post" action="/projects/{{ project.id }}/modules/discord/toggle" class="toggle-form">
+    <input type="hidden" name="_csrf" value="{{ page.csrf }}">
+    <input type="hidden" name="back" value="module">
+    {% if enabled %}
+    <span class="badge badge-on">Enabled</span>
+    <input type="hidden" name="enabled" value="0">
+    <button class="btn btn-ghost" type="submit">Disable</button>
+    {% else %}
+    <span class="badge badge-off">Disabled</span>
+    <input type="hidden" name="enabled" value="1">
+    <button class="btn btn-primary" type="submit">Enable</button>
+    {% endif %}
+  </form>
+</header>
+
+{% for w in warnings %}
+<div class="callout callout-warn">{{ w }}</div>
+{% endfor %}
+
+<div class="two-col">
+  <div class="stack">
+    {% include "keys/cards.html" %}
+  </div>
+
+  <div class="stack">
+    {% if let Some(bot) = bot %}
+    <section class="card bot-card">
+      {% if let Some(avatar) = bot.avatar %}
+      <img class="avatar-lg" src="{{ avatar }}" alt="">
+      {% else %}
+      <span class="avatar-lg avatar-empty"></span>
+      {% endif %}
+      <div class="bot-meta">
+        <h2>{% if let Some(name) = bot.name %}{{ name }}{% else %}Bot{% endif %}</h2>
+        <div class="bot-status">
+          <span class="dot {% if bot.online %}dot-on{% else %}dot-off{% endif %}"></span>
+          <span>{{ bot.stage }}</span>
+          {% if let Some(ms) = bot.latency_ms %}<span class="muted">, {{ ms }} ms gateway latency</span>{% endif %}
+        </div>
+        {% if bot.online %}<span class="muted small">Member of {{ bot.guild_count }} servers</span>{% endif %}
+      </div>
+    </section>
+    {% if let Some(error) = bot.error %}
+    <div class="callout callout-err small">{{ error }}</div>
+    {% endif %}
+    {% endif %}
+
+    <section class="card">
+      <h2>Used by</h2>
+      {% if users.is_empty() %}
+      <p class="muted">No enabled module uses this bot yet.</p>
+      {% else %}
+      <p>{{ users.join(", ") }}</p>
+      {% endif %}
+      <p class="hint">Modules use this bot unless they are given their own token on their page.</p>
+    </section>
+
+    <section class="card">
+      <h2>Setup</h2>
+      <ol class="hint">
+        <li>Create an application at discord.com/developers/applications and add a bot.</li>
+        <li>On the Bot tab, turn on Server Members Intent and copy the token into the card on the left.</li>
+        <li>Invite the bot with OAuth2, URL Generator: scope bot, permissions View Channels, Send Messages, Embed Links, Add Reactions, Read Message History.</li>
+        <li>Pick the server, then enable this module.</li>
+      </ol>
+    </section>
+  </div>
+</div>
+{% endblock %}

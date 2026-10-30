@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::{CalendarConfig, ID};
 use crate::clickup::ClickUpError;
 use crate::clickup::client::{Task, TaskQuery, User};
-use crate::clickup::tokens::{self, TokenProblem};
+use crate::keys::{self, KeyProblem, Service};
 use crate::state::AppState;
 
 pub const MAX_PAGES: u32 = 5;
@@ -89,7 +89,7 @@ impl Event {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FetchError {
     NoList,
-    Token(TokenProblem),
+    Token(KeyProblem),
     Api(ClickUpError),
 }
 
@@ -97,7 +97,7 @@ impl FetchError {
     pub fn message(&self) -> String {
         match self {
             FetchError::NoList => "No ClickUp list is selected.".into(),
-            FetchError::Token(p) => p.message().into(),
+            FetchError::Token(p) => p.message(Service::ClickUp).into(),
             FetchError::Api(e) => e.to_string(),
         }
     }
@@ -106,9 +106,9 @@ impl FetchError {
     pub fn code(&self) -> &'static str {
         match self {
             FetchError::NoList => "calendar_no_list",
-            FetchError::Token(TokenProblem::NotSet) => "token_missing",
-            FetchError::Token(TokenProblem::Unreadable) => "token_unreadable",
-            FetchError::Token(TokenProblem::SharedModuleDisabled) => "clickup_disabled",
+            FetchError::Token(KeyProblem::NotSet) => "token_missing",
+            FetchError::Token(KeyProblem::Unreadable) => "token_unreadable",
+            FetchError::Token(KeyProblem::SharedModuleDisabled) => "clickup_disabled",
             FetchError::Api(ClickUpError::Unauthorized) => "token_check_failed",
             FetchError::Api(ClickUpError::NotFound) => "list_not_found",
             FetchError::Api(_) => "clickup_unreachable",
@@ -139,7 +139,7 @@ impl Fetched {
 /// Reads events happening between `from` and `to` (unix seconds) from ClickUp.
 pub async fn fetch(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     cfg: &CalendarConfig,
     from: i64,
     to: i64,
@@ -147,7 +147,7 @@ pub async fn fetch(
     let Some(list_id) = cfg.list_id.as_deref() else {
         return Ok(Err(FetchError::NoList));
     };
-    let cred = match tokens::resolve(state, guild_id, ID).await? {
+    let cred = match keys::resolve(state, project_id, Service::ClickUp, ID).await? {
         Ok(c) => c,
         Err(p) => return Ok(Err(FetchError::Token(p))),
     };
@@ -167,7 +167,7 @@ pub async fn fetch(
         .clickup
         .tasks(&cred.token, list_id, &query, MAX_PAGES)
         .await;
-    let (tasks, truncated) = match tokens::track(&state.db, guild_id, ID, &cred, result).await {
+    let (tasks, truncated) = match keys::track(&state.db, project_id, ID, &cred, result).await {
         Ok(r) => r,
         Err(e) => return Ok(Err(FetchError::Api(e))),
     };
@@ -184,15 +184,15 @@ pub async fn fetch(
     }))
 }
 
-fn cache_prefix(guild_id: u64) -> String {
-    format!("calendar:events:{guild_id}:")
+fn cache_prefix(project_id: i64) -> String {
+    format!("calendar:events:{project_id}:")
 }
 
 /// Changing any of these settings must not reuse events fetched with the old ones.
-fn cache_key(guild_id: u64, cfg: &CalendarConfig) -> String {
+fn cache_key(project_id: i64, cfg: &CalendarConfig) -> String {
     format!(
         "{}{}|{}|{}|{}|{}",
-        cache_prefix(guild_id),
+        cache_prefix(project_id),
         cfg.list_id.as_deref().unwrap_or_default(),
         cfg.time_field,
         cfg.tag_filter,
@@ -204,13 +204,13 @@ fn cache_key(guild_id: u64, cfg: &CalendarConfig) -> String {
 /// Events from now until at least `now + horizon`, reusing a fetch younger than `max_age`.
 pub async fn cached(
     state: &AppState,
-    guild_id: u64,
+    project_id: i64,
     cfg: &CalendarConfig,
     now: i64,
     horizon: i64,
     max_age: Duration,
 ) -> anyhow::Result<Result<Arc<Fetched>, FetchError>> {
-    let key = cache_key(guild_id, cfg);
+    let key = cache_key(project_id, cfg);
     let horizon = horizon.max(MIN_HORIZON_SECS);
     if let Some(hit) = state.cache.get::<Fetched>(&key, max_age)
         && hit.to >= now + horizon
@@ -220,7 +220,7 @@ pub async fn cached(
     // Fetch a little further than needed so the next minutes are still covered.
     let fetched = fetch(
         state,
-        guild_id,
+        project_id,
         cfg,
         now - LOOKBACK_SECS,
         now + horizon + 3600,
@@ -229,8 +229,8 @@ pub async fn cached(
     Ok(fetched.map(|f| state.cache.insert(key, f)))
 }
 
-pub fn invalidate(state: &AppState, guild_id: u64) {
-    state.cache.remove_prefix(&cache_prefix(guild_id));
+pub fn invalidate(state: &AppState, project_id: i64) {
+    state.cache.remove_prefix(&cache_prefix(project_id));
 }
 
 #[cfg(test)]
@@ -283,15 +283,14 @@ mod tests {
         let mut state = test_util::state().await;
         let mock = MockClickUp::start().await;
         state.clickup = mock.client();
-        set_enabled(&state.db, 1, tokens::SHARED, true)
-            .await
-            .unwrap();
+        set_enabled(&state.db, 1, "clickup", true).await.unwrap();
         let key = SecretString::new(mock::TOKEN);
-        tokens::store(
+        keys::store(
             &state.db,
             &state.vault,
             1,
-            tokens::SHARED,
+            Service::ClickUp,
+            "clickup",
             &key,
             "Test Owner",
             "root",
@@ -426,7 +425,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_err(),
-            FetchError::Token(TokenProblem::SharedModuleDisabled)
+            FetchError::Token(KeyProblem::SharedModuleDisabled)
         );
         let missing = CalendarConfig {
             list_id: Some("999".into()),

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use askama::Template;
@@ -10,14 +11,18 @@ use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use serde::Deserialize;
 
-use super::{MsgQuery, PageCtx, fmt_duration, fmt_ts, redirect_msg, require_guild};
+use super::{MsgQuery, PageCtx, fmt_duration, fmt_ts, redirect_msg, require_project};
 use crate::auth::extract::{CurrentUser, RootUser, client_ip};
 use crate::auth::{self, SESSION_COOKIE, SESSION_TTL_SECS};
-use crate::bot::info::{self, BotStatus, GuildSummary};
-use crate::bot::privileged_names;
 use crate::db::now;
+use crate::discord::connection;
+use crate::discord::hub::DiscordHub;
+use crate::discord::info::{self, BotStatus, GuildSummary};
+use crate::discord::privileged_names;
 use crate::error::{AppError, AppResult};
-use crate::modules::{self, StatItem};
+use crate::keys::{self, Service};
+use crate::modules::{self, Module, StatItem};
+use crate::projects::{self, Project};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------- login
@@ -108,26 +113,28 @@ pub async fn logout(
 
 // ---------------------------------------------------------------- overview
 
-struct GuildRow {
-    guild: GuildSummary,
+struct ProjectRow {
+    project: Project,
     modules_enabled: i64,
+    /// Discord server of the project's Discord module, if one is selected.
+    server: Option<String>,
 }
 
 #[derive(Template)]
 #[template(path = "overview.html")]
 struct OverviewPage {
     page: PageCtx,
-    bot: BotStatus,
-    token_configured: bool,
+    bots: Vec<BotStatus>,
     uptime: String,
-    guild_count: usize,
-    member_total: u64,
     member_joins: u64,
     events_handled: u64,
     greetings_total: i64,
     calendar_total: i64,
+    recurred_total: i64,
     module_count: usize,
-    guilds: Vec<GuildRow>,
+    projects: Vec<ProjectRow>,
+    can_create: bool,
+    max_name: usize,
 }
 
 pub async fn overview(
@@ -135,38 +142,42 @@ pub async fn overview(
     CurrentUser(user): CurrentUser,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    let discord = state.discord();
-    let bot = info::status(&state).await;
-    let guilds = discord.map(|d| info::guilds(&d.cache)).unwrap_or_default();
+    let mut bots = Vec::new();
+    for (_, client) in state.discord.all() {
+        bots.push(info::status(&state, Some(&client)).await);
+    }
 
-    let mut rows = Vec::with_capacity(guilds.len());
-    for guild in guilds {
-        let modules_enabled = modules::enabled_count(&state.db, guild.id).await?;
-        rows.push(GuildRow {
-            guild,
-            modules_enabled,
+    let list = projects::list(&state.db).await?;
+    let mut rows = Vec::with_capacity(list.len());
+    for project in list {
+        rows.push(ProjectRow {
+            modules_enabled: modules::enabled_count(&state.db, project.id).await?,
+            server: connection::server(&state.db, project.id, modules::discord::ID)
+                .await?
+                .map(|(_, name)| name),
+            project,
         });
     }
 
     let stats = &state.stats;
     let page = OverviewPage {
         page: PageCtx::new(&user, "overview", &msg),
-        bot,
-        token_configured: state.config.discord_token.is_some(),
+        bots,
         uptime: fmt_duration(stats.started_at.elapsed().as_secs()),
-        guild_count: rows.len(),
-        member_total: rows.iter().map(|r| r.guild.member_count).sum(),
         member_joins: stats.member_joins.load(Ordering::Relaxed),
         events_handled: stats.events_handled.load(Ordering::Relaxed),
         greetings_total: modules::counter(&state.db, None, modules::greeting::ID, "sent").await?,
         calendar_total: modules::calendar::posts_sent(&state.db, None).await?,
+        recurred_total: modules::recurring::recurred(&state.db, None).await?,
         module_count: state.modules.len(),
-        guilds: rows,
+        can_create: (rows.len() as i64) < projects::MAX_PROJECTS,
+        projects: rows,
+        max_name: projects::MAX_NAME_LEN,
     };
     Ok(Html(page.render()?))
 }
 
-// ---------------------------------------------------------------- guild
+// ---------------------------------------------------------------- projects
 
 struct ModuleCard {
     id: &'static str,
@@ -174,42 +185,131 @@ struct ModuleCard {
     description: &'static str,
     enabled: bool,
     stats: Vec<StatItem>,
-    /// Developer portal names of privileged intents this module needs but the bot runs without.
+    /// Services the module talks to.
+    uses: Vec<&'static str>,
+    /// Why an enabled module cannot work right now.
+    problems: Vec<String>,
+    /// Developer portal names of privileged intents this module needs but its bot runs without.
     missing_intents: Vec<&'static str>,
 }
 
 #[derive(Template)]
-#[template(path = "guild.html")]
-struct GuildPage {
+#[template(path = "project.html")]
+struct ProjectPage {
     page: PageCtx,
-    guild: GuildSummary,
+    project: Project,
+    /// The Discord server of the project's Discord module, while its bot is connected.
+    server: Option<GuildSummary>,
     modules: Vec<ModuleCard>,
+    max_name: usize,
 }
 
-pub async fn guild_page(
+async fn module_card(state: &AppState, pid: i64, m: &Arc<dyn Module>) -> AppResult<ModuleCard> {
+    let enabled = modules::is_enabled(&state.db, pid, m.id()).await?;
+    let uses_discord = m.id() == modules::discord::ID || m.services().contains(&Service::Discord);
+    let mut problems = Vec::new();
+    let mut missing_intents = Vec::new();
+    if enabled {
+        for service in m.services() {
+            if *service == Service::ClickUp
+                && let Err(p) = keys::resolve(state, pid, *service, m.id()).await?
+            {
+                problems.push(p.message(*service).to_owned());
+            }
+        }
+        if uses_discord {
+            match connection::connection(state, pid, m.id()).await? {
+                Ok(conn) => {
+                    missing_intents = privileged_names(m.intents().difference(conn.handle.intents))
+                }
+                Err(p) => problems.push(p.message()),
+            }
+        }
+    }
+    Ok(ModuleCard {
+        id: m.id(),
+        name: m.name(),
+        description: m.description(),
+        enabled,
+        stats: m.summary(state, pid).await?,
+        uses: m.services().iter().map(|s| s.name()).collect(),
+        problems,
+        missing_intents,
+    })
+}
+
+pub async fn project_page(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path(gid): Path<u64>,
+    Path(pid): Path<i64>,
     Query(msg): Query<MsgQuery>,
 ) -> AppResult<Html<String>> {
-    let guild = require_guild(&state, gid)?;
+    let project = require_project(&state, pid).await?;
     let mut cards = Vec::with_capacity(state.modules.len());
     for m in state.modules.iter() {
-        cards.push(ModuleCard {
-            id: m.id(),
-            name: m.name(),
-            description: m.description(),
-            enabled: modules::is_enabled(&state.db, gid, m.id()).await?,
-            stats: m.summary(&state, gid).await?,
-            missing_intents: privileged_names(state.missing_intents(m.intents())),
-        });
+        cards.push(module_card(&state, pid, m).await?);
     }
-    let page = GuildPage {
-        page: PageCtx::new(&user, "guilds", &msg),
-        guild,
+    let server = connection::connection(&state, pid, modules::discord::ID)
+        .await?
+        .ok()
+        .and_then(|c| c.guild());
+    let page = ProjectPage {
+        page: PageCtx::new(&user, "projects", &msg),
+        project,
+        server,
         modules: cards,
+        max_name: projects::MAX_NAME_LEN,
     };
     Ok(Html(page.render()?))
+}
+
+#[derive(Deserialize)]
+pub struct ProjectForm {
+    name: String,
+}
+
+pub async fn project_create(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Form(form): Form<ProjectForm>,
+) -> AppResult<Response> {
+    let Some(name) = projects::normalize_name(&form.name) else {
+        return Ok(redirect_msg("/", "project_name"));
+    };
+    let Some(pid) = projects::create(&state.db, &name, &user.username).await? else {
+        return Ok(redirect_msg("/", "too_many_projects"));
+    };
+    tracing::info!(user = %user.username, project_id = pid, "project created");
+    Ok(redirect_msg(&format!("/projects/{pid}"), "project_created"))
+}
+
+pub async fn project_rename(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(pid): Path<i64>,
+    Form(form): Form<ProjectForm>,
+) -> AppResult<Response> {
+    require_project(&state, pid).await?;
+    let back = format!("/projects/{pid}");
+    let Some(name) = projects::normalize_name(&form.name) else {
+        return Ok(redirect_msg(&back, "project_name"));
+    };
+    projects::rename(&state.db, pid, &name, &user.username).await?;
+    tracing::info!(user = %user.username, project_id = pid, "project renamed");
+    Ok(redirect_msg(&back, "project_renamed"))
+}
+
+/// Deletes a project with everything in it. Root only.
+pub async fn project_delete(
+    State(state): State<AppState>,
+    RootUser(user): RootUser,
+    Path(pid): Path<i64>,
+) -> AppResult<Response> {
+    let project = require_project(&state, pid).await?;
+    projects::delete(&state.db, pid).await?;
+    DiscordHub::reconcile_soon(&state);
+    tracing::warn!(user = %user.username, project_id = pid, name = %project.name, "project deleted");
+    Ok(redirect_msg("/", "project_deleted"))
 }
 
 #[derive(Deserialize)]
@@ -221,24 +321,61 @@ pub struct ToggleForm {
 pub async fn toggle_module(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((gid, mid)): Path<(u64, String)>,
+    Path((pid, mid)): Path<(i64, String)>,
     Form(form): Form<ToggleForm>,
 ) -> AppResult<Response> {
-    require_guild(&state, gid)?;
+    require_project(&state, pid).await?;
     let module = state.module(&mid).ok_or(AppError::NotFound)?;
     let enabled = form.enabled == "1";
-    modules::set_enabled(&state.db, gid, module.id(), enabled).await?;
-    tracing::info!(user = %user.username, guild_id = gid, module = module.id(), enabled, "module toggled");
+    modules::set_enabled(&state.db, pid, module.id(), enabled).await?;
+    if module.id() == modules::discord::ID || module.services().contains(&Service::Discord) {
+        DiscordHub::reconcile_soon(&state);
+    }
+    tracing::info!(user = %user.username, project_id = pid, module = module.id(), enabled, "module toggled");
 
     // Only two fixed targets, never an arbitrary redirect.
     let back = match form.back.as_deref() {
-        Some("module") => format!("/guilds/{gid}/modules/{}", module.id()),
-        _ => format!("/guilds/{gid}"),
+        Some("module") => format!("/projects/{pid}/modules/{}", module.id()),
+        _ => format!("/projects/{pid}"),
     };
     Ok(redirect_msg(
         &back,
         if enabled { "enabled" } else { "disabled" },
     ))
+}
+
+/// `/guilds/{gid}`: the project migrated from that server.
+pub async fn legacy_guild(
+    State(state): State<AppState>,
+    CurrentUser(_user): CurrentUser,
+    Path(gid): Path<u64>,
+) -> AppResult<Response> {
+    let pid = projects::by_legacy_guild(&state.db, gid)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Redirect::to(&format!("/projects/{pid}")).into_response())
+}
+
+/// `/guilds/{gid}/modules/...`: the same module page of the project migrated from that
+/// server. Only plain module paths are accepted.
+pub async fn legacy_guild_path(
+    State(state): State<AppState>,
+    CurrentUser(_user): CurrentUser,
+    Path((gid, rest)): Path<(u64, String)>,
+) -> AppResult<Response> {
+    let plain = rest.starts_with("modules/")
+        && rest.len() <= 200
+        && !rest.contains("//")
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'));
+    if !plain {
+        return Err(AppError::NotFound);
+    }
+    let pid = projects::by_legacy_guild(&state.db, gid)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Redirect::to(&format!("/projects/{pid}/{rest}")).into_response())
 }
 
 // ---------------------------------------------------------------- account

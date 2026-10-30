@@ -1,15 +1,15 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use serenity::all::{Cache, GatewayIntents, Http, ShardManager};
 use sqlx::SqlitePool;
 
 use crate::auth::limiter::LoginLimiter;
-use crate::bot::members::MemberCache;
 use crate::cache::TtlCache;
 use crate::clickup::ClickUpClient;
 use crate::config::Config;
+use crate::discord::hub::DiscordHub;
+use crate::discord::members::MemberCache;
 use crate::modules::Module;
 use crate::secrets::Vault;
 
@@ -23,23 +23,12 @@ pub struct AppState {
     /// Encrypts API keys stored in the database.
     pub vault: Arc<Vault>,
     pub clickup: ClickUpClient,
-    /// Recently fetched guild member lists.
+    /// Running Discord bots, one per bot token in use.
+    pub discord: Arc<DiscordHub>,
+    /// Recently fetched Discord server member lists.
     pub members: Arc<MemberCache>,
     /// Module data fetched from other services, e.g. ClickUp tasks.
     pub cache: Arc<TtlCache>,
-    /// Set once the serenity client is built. Stays empty when no token is configured.
-    pub discord: Arc<OnceLock<DiscordHandle>>,
-    /// Why the Discord connection is down, shown on the dashboard. None while healthy.
-    bot_error: Arc<Mutex<Option<String>>>,
-}
-
-#[derive(Clone)]
-pub struct DiscordHandle {
-    pub http: Arc<Http>,
-    pub cache: Arc<Cache>,
-    pub shard_manager: Arc<ShardManager>,
-    /// Intents the gateway connection was opened with.
-    pub intents: GatewayIntents,
 }
 
 impl AppState {
@@ -57,38 +46,14 @@ impl AppState {
             limiter: Arc::new(LoginLimiter::default()),
             vault: Arc::new(vault),
             clickup: ClickUpClient::default(),
+            discord: Arc::new(DiscordHub::default()),
             members: Arc::new(MemberCache::default()),
             cache: Arc::new(TtlCache::default()),
-            discord: Arc::new(OnceLock::new()),
-            bot_error: Arc::new(Mutex::new(None)),
         }
-    }
-
-    pub fn discord(&self) -> Option<&DiscordHandle> {
-        self.discord.get()
     }
 
     pub fn module(&self, id: &str) -> Option<&Arc<dyn Module>> {
         self.modules.iter().find(|m| m.id() == id)
-    }
-
-    /// Intents that `wanted` asks for but the running connection does not have.
-    /// Empty when the bot is not connected at all.
-    pub fn missing_intents(&self, wanted: GatewayIntents) -> GatewayIntents {
-        self.discord()
-            .map(|d| wanted.difference(d.intents))
-            .unwrap_or_else(GatewayIntents::empty)
-    }
-
-    pub fn bot_error(&self) -> Option<String> {
-        self.bot_error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    pub fn set_bot_error(&self, error: impl Into<String>) {
-        *self.bot_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.into());
     }
 }
 

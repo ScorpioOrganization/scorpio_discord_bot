@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Deprecated. Imported once into the Discord module of the projects created from Discord
+    /// servers (see `upgrade::import_discord_token`), ignored afterwards.
     pub discord_token: Option<String>,
     pub database_url: String,
     pub web_bind: SocketAddr,

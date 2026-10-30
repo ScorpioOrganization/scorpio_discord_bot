@@ -2,10 +2,11 @@
 
 use serenity::all::{Cache, ChannelType, ConnectionStage, GuildId, Permissions};
 
+use super::connection::Conn;
+use super::hub::Status;
 use crate::state::AppState;
 
 pub struct GuildSummary {
-    pub id: u64,
     pub name: String,
     pub icon: Option<String>,
     pub member_count: u64,
@@ -49,20 +50,12 @@ pub struct BotStatus {
     pub latency_ms: Option<u128>,
     pub name: Option<String>,
     pub avatar: Option<String>,
-    /// Why the connection is down, when it stopped for good.
+    /// Servers the bot is in.
+    pub guild_count: usize,
+    /// Why the connection is down, when it stopped.
     pub error: Option<String>,
     /// Developer portal names of privileged intents modules need but the bot runs without.
     pub missing_intents: Vec<&'static str>,
-}
-
-pub fn guilds(cache: &Cache) -> Vec<GuildSummary> {
-    let mut list: Vec<_> = cache
-        .guilds()
-        .into_iter()
-        .filter_map(|id| guild(cache, id.get()))
-        .collect();
-    list.sort_by_key(|g| g.name.to_lowercase());
-    list
 }
 
 pub fn guild(cache: &Cache, guild_id: u64) -> Option<GuildSummary> {
@@ -71,7 +64,6 @@ pub fn guild(cache: &Cache, guild_id: u64) -> Option<GuildSummary> {
     }
     let g = cache.guild(GuildId::new(guild_id))?;
     Some(GuildSummary {
-        id: guild_id,
         name: g.name.clone(),
         icon: g.icon_url(),
         member_count: g.member_count,
@@ -114,6 +106,30 @@ pub fn text_channels(cache: &Cache, guild_id: u64) -> Vec<ChannelOption> {
     channels.into_iter().map(|(_, c)| c).collect()
 }
 
+/// Text channels of a connection's server to pick from. While the bot cannot be reached the
+/// saved channel stays in the list, so saving other settings does not clear it.
+pub fn channel_choices(conn: Option<&Conn>, saved: Option<u64>) -> Vec<ChannelOption> {
+    let mut channels = match conn {
+        Some(c) => text_channels(&c.handle.cache, c.guild_id),
+        None => match saved {
+            Some(id) => vec![ChannelOption {
+                id,
+                name: format!("{id} (saved, bot not connected)"),
+                can_send: true,
+                can_embed: true,
+                can_react: true,
+                can_mention_all: true,
+                selected: false,
+            }],
+            None => Vec::new(),
+        },
+    };
+    for c in &mut channels {
+        c.selected = Some(c.id) == saved;
+    }
+    channels
+}
+
 /// Roles of a guild, highest first, without `@everyone`.
 pub fn roles(cache: &Cache, guild_id: u64) -> Vec<RoleOption> {
     if guild_id == 0 {
@@ -141,22 +157,30 @@ pub fn roles(cache: &Cache, guild_id: u64) -> Vec<RoleOption> {
     roles.into_iter().map(|(_, r)| r).collect()
 }
 
-pub async fn status(state: &AppState) -> BotStatus {
-    let error = state.bot_error();
-    let Some(handle) = state.discord() else {
-        return BotStatus {
-            online: false,
-            stage: if error.is_some() {
-                "Stopped"
-            } else {
-                "Not configured"
-            },
-            latency_ms: None,
-            name: None,
-            avatar: None,
-            error,
-            missing_intents: Vec::new(),
-        };
+/// Status of one bot connection, None when it was never started.
+pub async fn status(state: &AppState, client: Option<&Status>) -> BotStatus {
+    let handle = match client {
+        Some(Status::Running(h)) => h,
+        other => {
+            let error = match other {
+                Some(Status::Failed { error, .. }) => Some(error.clone()),
+                _ => None,
+            };
+            return BotStatus {
+                online: false,
+                stage: if error.is_some() {
+                    "Stopped"
+                } else {
+                    "Not connected"
+                },
+                latency_ms: None,
+                name: None,
+                avatar: None,
+                guild_count: 0,
+                error,
+                missing_intents: Vec::new(),
+            };
+        }
     };
 
     let (stage, latency) = {
@@ -174,11 +198,11 @@ pub async fn status(state: &AppState) -> BotStatus {
             (Some(user.name.clone()), Some(user.face()))
         }
     };
+    let wanted = super::wanted_intents(&state.modules);
 
     BotStatus {
         online: stage == ConnectionStage::Connected,
         stage: match stage {
-            _ if error.is_some() => "Stopped",
             ConnectionStage::Connected => "Online",
             ConnectionStage::Disconnected => "Offline",
             ConnectionStage::Resuming => "Resuming",
@@ -187,9 +211,8 @@ pub async fn status(state: &AppState) -> BotStatus {
         latency_ms: latency.map(|d| d.as_millis()),
         name,
         avatar,
-        error,
-        missing_intents: super::privileged_names(
-            state.missing_intents(super::wanted_intents(&state.modules)),
-        ),
+        guild_count: handle.cache.guild_count(),
+        error: None,
+        missing_intents: super::privileged_names(wanted.difference(handle.intents)),
     }
 }

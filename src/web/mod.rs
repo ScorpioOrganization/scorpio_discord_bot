@@ -18,8 +18,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::auth::SessionUser;
 use crate::auth::extract::session_middleware;
-use crate::bot::info::{self, GuildSummary};
 use crate::error::AppError;
+use crate::projects::{self, Project};
 use crate::state::AppState;
 
 const APP_CSS: &str = include_str!("../../static/app.css");
@@ -54,11 +54,17 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(pages::overview))
         .route("/login", get(pages::login_page).post(pages::login_submit))
         .route("/logout", post(pages::logout))
-        .route("/guilds/{gid}", get(pages::guild_page))
+        .route("/projects", post(pages::project_create))
+        .route("/projects/{pid}", get(pages::project_page))
+        .route("/projects/{pid}/rename", post(pages::project_rename))
+        .route("/projects/{pid}/delete", post(pages::project_delete))
         .route(
-            "/guilds/{gid}/modules/{mid}/toggle",
+            "/projects/{pid}/modules/{mid}/toggle",
             post(pages::toggle_module),
         )
+        // Links from before projects, when everything was per Discord server.
+        .route("/guilds/{gid}", get(pages::legacy_guild))
+        .route("/guilds/{gid}/{*rest}", get(pages::legacy_guild_path))
         .route("/account", get(pages::account_page))
         .route("/account/password", post(pages::account_password))
         .route("/users", get(pages::users_page).post(pages::user_create))
@@ -176,13 +182,16 @@ impl Flash {
                 false,
                 "Pick a channel and save before sending a test message.",
             ),
-            "bot_offline" => (false, "The bot is not connected to Discord."),
-            "invalid_channel" => (false, "Pick a text channel from this server."),
+            "bot_offline" => (
+                false,
+                "This module cannot reach Discord right now. See the Discord bot token card.",
+            ),
+            "invalid_channel" => (false, "Pick a text channel from the Discord server."),
             "template_empty" => (false, "The message cannot be empty."),
             "template_long" => (false, "The message is too long."),
             "invalid_color" => (false, "Embed color must look like #7f8cff."),
             "token_saved" => (true, "API key checked with ClickUp and saved."),
-            "token_removed" => (true, "API key removed."),
+            "token_removed" => (true, "Key removed."),
             "token_invalid" => (
                 false,
                 "That does not look like a ClickUp personal API key, which starts with pk_.",
@@ -202,7 +211,32 @@ impl Flash {
                 false,
                 "The saved API key cannot be decrypted. Save the key again.",
             ),
-            "source_saved" => (true, "API key choice saved."),
+            "source_saved" => (true, "Key choice saved."),
+            "discord_token_saved" => (true, "Bot token checked with Discord and saved."),
+            "discord_token_invalid" => (
+                false,
+                "That does not look like a Discord bot token. Copy it from the Bot tab of the \
+                 developer portal.",
+            ),
+            "discord_token_rejected" => {
+                (false, "Discord rejected this bot token. Nothing was saved.")
+            }
+            "discord_unreachable" => (
+                false,
+                "Could not reach Discord. Nothing was changed, try again in a moment.",
+            ),
+            "discord_token_missing" => (false, "Save a Discord bot token first."),
+            "server_saved" => (true, "Discord server saved."),
+            "server_invalid" => (false, "Pick a server the bot is a member of."),
+            "reconnecting" => (
+                true,
+                "Reconnecting the bot. Reload the page in a few seconds.",
+            ),
+            "project_created" => (true, "Project created."),
+            "project_renamed" => (true, "Project renamed."),
+            "project_deleted" => (true, "Project deleted."),
+            "project_name" => (false, "The project name must be 1 to 60 characters."),
+            "too_many_projects" => (false, "The maximum number of projects is reached."),
             "workspace_saved" => (true, "Workspace saved."),
             "workspace_invalid" => (false, "Pick a workspace this API key can access."),
             "mapping_saved" => (true, "Mappings saved."),
@@ -213,14 +247,17 @@ impl Flash {
             ),
             "members_refreshed" => (true, "Server members reloaded."),
             "tag_roles_saved" => (true, "Tag roles saved."),
-            "role_unknown" => (false, "Pick a role from this server. Nothing was saved."),
+            "role_unknown" => (
+                false,
+                "Pick a role from the Discord server. Nothing was saved.",
+            ),
             "tag_invalid" => (
                 false,
                 "Tags must be 1 to 100 characters. Nothing was saved.",
             ),
             "too_many_tag_roles" => (
                 false,
-                "This server has the maximum number of tag roles. Nothing was saved.",
+                "This project has the maximum number of tag roles. Nothing was saved.",
             ),
             "clickup_disabled" => (
                 false,
@@ -237,7 +274,7 @@ impl Flash {
             "refreshed" => (true, "Reloaded from ClickUp."),
             "rule_created" => (true, "Rule created."),
             "rule_deleted" => (true, "Rule deleted."),
-            "too_many_rules" => (false, "This server has the maximum number of rules."),
+            "too_many_rules" => (false, "This project has the maximum number of rules."),
             "rule_name" => (false, "The rule name must be 1 to 60 characters."),
             "rule_no_days" => (false, "Pick at least one day."),
             "rule_time" => (false, "The time must look like 09:00."),
@@ -254,7 +291,7 @@ impl Flash {
             "rule_description_max" => (false, "The description length must be 0 to 1000."),
             "reactions_invalid" => (
                 false,
-                "Reactions must be up to 5 emojis, custom ones from this server only.",
+                "Reactions must be up to 5 emojis, custom ones from the Discord server only.",
             ),
             "recurring_no_workspace" => (false, "Select and save a ClickUp workspace first."),
             "recurring_no_rules" => (false, "Add an active rule first."),
@@ -327,11 +364,10 @@ pub fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// Looks up a guild the bot is a member of. Everything guild related 404s otherwise.
-pub fn require_guild(state: &AppState, guild_id: u64) -> Result<GuildSummary, AppError> {
-    state
-        .discord()
-        .and_then(|d| info::guild(&d.cache, guild_id))
+/// Looks up a project. Everything under `/projects/{pid}` 404s for unknown ones.
+pub async fn require_project(state: &AppState, project_id: i64) -> Result<Project, AppError> {
+    projects::get(&state.db, project_id)
+        .await?
         .ok_or(AppError::NotFound)
 }
 

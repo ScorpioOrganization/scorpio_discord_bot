@@ -5,14 +5,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::Router;
 use serenity::all::{
-    ChannelId, Context, CreateAllowedMentions, CreateEmbed, CreateMessage, GatewayIntents, Http,
-    Member, UserId,
+    ChannelId, Context, CreateAllowedMentions, CreateEmbed, CreateMessage, GatewayIntents, GuildId,
+    Http, Member, UserId,
 };
 use sqlx::SqlitePool;
 
 use self::template::{DEFAULT_TEMPLATE, Vars};
 use super::{Module, StatItem, bump_counter, counter};
 use crate::db::{now, sf};
+use crate::discord::connection::connection;
+use crate::keys::Service;
 use crate::state::AppState;
 
 pub const ID: &str = "greeting";
@@ -37,13 +39,19 @@ impl Module for GreetingModule {
         "Posts a customizable welcome message when someone joins the server."
     }
 
-    async fn summary(&self, state: &AppState, guild_id: u64) -> Result<Vec<StatItem>> {
-        let cfg = load_config(&state.db, guild_id).await?;
-        let channel = match (cfg.channel_id, state.discord()) {
+    fn services(&self) -> &'static [Service] {
+        &[Service::Discord]
+    }
+
+    async fn summary(&self, state: &AppState, project_id: i64) -> Result<Vec<StatItem>> {
+        let cfg = load_config(&state.db, project_id).await?;
+        let conn = connection(state, project_id, ID).await?.ok();
+        let channel = match (cfg.channel_id, conn) {
             (None, _) => "Not set".to_owned(),
-            (Some(id), Some(d)) => d
+            (Some(id), Some(c)) => c
+                .handle
                 .cache
-                .guild(serenity::all::GuildId::new(guild_id))
+                .guild(GuildId::new(c.guild_id))
                 .and_then(|g| {
                     g.channels
                         .get(&ChannelId::new(id as u64))
@@ -56,11 +64,11 @@ impl Module for GreetingModule {
             StatItem::new("Channel", channel),
             StatItem::new(
                 "Greetings sent",
-                counter(&state.db, Some(guild_id), ID, "sent").await?,
+                counter(&state.db, Some(project_id), ID, "sent").await?,
             ),
             StatItem::new(
                 "Last 7 days",
-                count_since(&state.db, guild_id, 7 * 86400).await?,
+                count_since(&state.db, project_id, 7 * 86400).await?,
             ),
         ])
     }
@@ -74,15 +82,20 @@ impl Module for GreetingModule {
         GatewayIntents::GUILD_MEMBERS
     }
 
-    async fn on_member_join(&self, ctx: &Context, state: &AppState, member: &Member) -> Result<()> {
-        let guild_id = member.guild_id.get();
-        let cfg = load_config(&state.db, guild_id).await?;
+    async fn on_member_join(
+        &self,
+        ctx: &Context,
+        state: &AppState,
+        project_id: i64,
+        member: &Member,
+    ) -> Result<()> {
+        let cfg = load_config(&state.db, project_id).await?;
 
         if member.user.bot && !cfg.greet_bots {
             return Ok(());
         }
         let Some(channel_id) = cfg.channel_id else {
-            tracing::debug!(guild_id, "greeting enabled but no channel configured");
+            tracing::debug!(project_id, "greeting enabled but no channel configured");
             return Ok(());
         };
 
@@ -108,7 +121,7 @@ impl Module for GreetingModule {
             member.face(),
         )
         .await;
-        log_attempt(&state.db, guild_id, &vars, &result, false).await
+        log_attempt(&state.db, project_id, &vars, &result, false).await
     }
 }
 
@@ -133,12 +146,12 @@ impl Default for GreetingConfig {
     }
 }
 
-pub async fn load_config(db: &SqlitePool, guild_id: u64) -> Result<GreetingConfig> {
+pub async fn load_config(db: &SqlitePool, project_id: i64) -> Result<GreetingConfig> {
     let cfg = sqlx::query_as(
         "SELECT channel_id, template, use_embed, embed_color, greet_bots
-         FROM greeting_config WHERE guild_id = ?",
+         FROM greeting_config WHERE project_id = ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_optional(db)
     .await?;
     Ok(cfg.unwrap_or_default())
@@ -146,15 +159,15 @@ pub async fn load_config(db: &SqlitePool, guild_id: u64) -> Result<GreetingConfi
 
 pub async fn save_config(
     db: &SqlitePool,
-    guild_id: u64,
+    project_id: i64,
     cfg: &GreetingConfig,
     by: &str,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO greeting_config
-             (guild_id, channel_id, template, use_embed, embed_color, greet_bots, updated_at, updated_by)
+             (project_id, channel_id, template, use_embed, embed_color, greet_bots, updated_at, updated_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (guild_id) DO UPDATE SET
+         ON CONFLICT (project_id) DO UPDATE SET
              channel_id = excluded.channel_id,
              template = excluded.template,
              use_embed = excluded.use_embed,
@@ -163,7 +176,7 @@ pub async fn save_config(
              updated_at = excluded.updated_at,
              updated_by = excluded.updated_by",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(cfg.channel_id)
     .bind(cfg.template.clone())
     .bind(cfg.use_embed)
@@ -220,19 +233,19 @@ async fn send(
 
 async fn log_attempt(
     db: &SqlitePool,
-    guild_id: u64,
+    project_id: i64,
     vars: &Vars,
     result: &Result<(), String>,
     is_test: bool,
 ) -> Result<()> {
     if let Err(e) = result {
-        tracing::warn!(guild_id, "greeting failed: {e}");
+        tracing::warn!(project_id, "greeting failed: {e}");
     }
     sqlx::query(
-        "INSERT INTO greeting_log (guild_id, user_id, user_name, success, error, is_test, created_at)
+        "INSERT INTO greeting_log (project_id, user_id, user_name, success, error, is_test, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(sf(vars.user_id))
     .bind(vars.display_name.clone())
     .bind(result.is_ok())
@@ -244,17 +257,17 @@ async fn log_attempt(
 
     if !is_test {
         let key = if result.is_ok() { "sent" } else { "failed" };
-        bump_counter(db, guild_id, ID, key).await?;
+        bump_counter(db, project_id, ID, key).await?;
     }
     Ok(())
 }
 
-async fn count_since(db: &SqlitePool, guild_id: u64, secs: i64) -> Result<i64> {
+async fn count_since(db: &SqlitePool, project_id: i64, secs: i64) -> Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT COUNT(*) FROM greeting_log
-         WHERE guild_id = ? AND success = 1 AND is_test = 0 AND created_at >= ?",
+         WHERE project_id = ? AND success = 1 AND is_test = 0 AND created_at >= ?",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .bind(now() - secs)
     .fetch_one(db)
     .await?)
@@ -286,27 +299,27 @@ pub struct GreetingStats {
     pub recent: Vec<LogRow>,
 }
 
-pub async fn load_stats(db: &SqlitePool, guild_id: u64) -> Result<GreetingStats> {
+pub async fn load_stats(db: &SqlitePool, project_id: i64) -> Result<GreetingStats> {
     let last_error = sqlx::query_as(
         "SELECT user_name, success, error, is_test, created_at FROM greeting_log
-         WHERE guild_id = ? AND success = 0 ORDER BY id DESC LIMIT 1",
+         WHERE project_id = ? AND success = 0 ORDER BY id DESC LIMIT 1",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_optional(db)
     .await?;
     let recent = sqlx::query_as(
         "SELECT user_name, success, error, is_test, created_at FROM greeting_log
-         WHERE guild_id = ? ORDER BY id DESC LIMIT 10",
+         WHERE project_id = ? ORDER BY id DESC LIMIT 10",
     )
-    .bind(sf(guild_id))
+    .bind(project_id)
     .fetch_all(db)
     .await?;
 
     Ok(GreetingStats {
-        sent_total: counter(db, Some(guild_id), ID, "sent").await?,
-        failed_total: counter(db, Some(guild_id), ID, "failed").await?,
-        sent_24h: count_since(db, guild_id, 86400).await?,
-        sent_7d: count_since(db, guild_id, 7 * 86400).await?,
+        sent_total: counter(db, Some(project_id), ID, "sent").await?,
+        failed_total: counter(db, Some(project_id), ID, "failed").await?,
+        sent_24h: count_since(db, project_id, 86400).await?,
+        sent_7d: count_since(db, project_id, 7 * 86400).await?,
         last_error,
         recent,
     })
@@ -386,7 +399,7 @@ mod tests {
         log_attempt(&db, 1, &vars(), &Ok(()), false).await.unwrap();
         for age in [LOG_RETENTION_SECS + 60, 30 * 86400] {
             sqlx::query(
-                "INSERT INTO greeting_log (guild_id, user_id, user_name, success, created_at)
+                "INSERT INTO greeting_log (project_id, user_id, user_name, success, created_at)
                  VALUES (1, 42, 'old', 1, ?)",
             )
             .bind(now() - age)

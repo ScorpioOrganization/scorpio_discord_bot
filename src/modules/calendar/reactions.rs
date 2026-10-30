@@ -133,6 +133,23 @@ pub fn guild_emojis(cache: &Cache, guild_id: u64) -> Vec<EmojiOption> {
     list
 }
 
+impl Reaction {
+    /// A custom emoji as an editor option, None for Unicode emojis.
+    pub fn as_emoji_option(&self) -> Option<EmojiOption> {
+        match self {
+            Reaction::Custom { id, name, animated } => Some(EmojiOption {
+                code: self.code(),
+                name: name.clone(),
+                url: format!(
+                    "https://cdn.discordapp.com/emojis/{id}.{}",
+                    if *animated { "gif" } else { "png" }
+                ),
+            }),
+            Reaction::Unicode(_) => None,
+        }
+    }
+}
+
 /// Custom emojis that are not (or no longer) in the guild.
 pub fn unknown_custom(reactions: &[Reaction], available: &[EmojiOption]) -> bool {
     reactions.iter().any(|r| match r {
@@ -207,12 +224,27 @@ mod tests {
         assert!(unknown_custom(&parse("<a:party:123>").unwrap(), &available));
     }
 
+    #[test]
+    fn saved_custom_reactions_become_options() {
+        let saved = parse("✅ <:party:123> <a:dance:456>").unwrap();
+        let options: Vec<EmojiOption> =
+            saved.iter().filter_map(Reaction::as_emoji_option).collect();
+        assert_eq!(options.len(), 2);
+        assert!(!unknown_custom(&saved, &options));
+        assert_eq!(options[0].url, "https://cdn.discordapp.com/emojis/123.png");
+        assert_eq!(options[1].url, "https://cdn.discordapp.com/emojis/456.gif");
+    }
+
     #[tokio::test]
     async fn guild_emojis_from_the_cache() {
         use crate::test_util::{EMOJI_ID, GUILD_ID, connect_fake_discord, state};
         let state = state().await;
-        connect_fake_discord(&state);
-        let cache = &state.discord().unwrap().cache;
+        connect_fake_discord(&state, 1).await;
+        let conn = crate::discord::connection::connection(&state, 1, "calendar")
+            .await
+            .unwrap()
+            .unwrap();
+        let cache = &conn.handle.cache;
         let emojis = guild_emojis(cache, GUILD_ID);
         assert_eq!(emojis.len(), 1);
         assert_eq!(emojis[0].code, format!("<:party:{EMOJI_ID}>"));
